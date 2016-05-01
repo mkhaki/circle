@@ -2,7 +2,7 @@
 // bcm2835.h
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014-2015  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2016  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -17,8 +17,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
-#ifndef _bcm2835_h
-#define _bcm2835_h
+#ifndef _circle_bcm2835_h
+#define _circle_bcm2835_h
 
 #include <circle/sysconfig.h>
 
@@ -209,6 +209,18 @@
 #define ARM_BSC_CLKT__OFFSET	0x1C
 
 //
+// SPI0 Master
+//
+#define ARM_SPI0_BASE		(ARM_IO_BASE + 0x204000)
+
+#define ARM_SPI0_CS		(ARM_SPI0_BASE + 0x00)
+#define ARM_SPI0_FIFO		(ARM_SPI0_BASE + 0x04)
+#define ARM_SPI0_CLK		(ARM_SPI0_BASE + 0x08)
+#define ARM_SPI0_DLEN		(ARM_SPI0_BASE + 0x0C)
+#define ARM_SPI0_LTOH		(ARM_SPI0_BASE + 0x10)
+#define ARM_SPI0_DC		(ARM_SPI0_BASE + 0x14)
+
+//
 // BSC / SPI Slave
 //
 #define ARM_BSC_SPI_SLAVE_BASE	(ARM_IO_BASE + 0x214000)
@@ -223,5 +235,15 @@
 #define ARM_BSC_SPI_SLAVE_RIS	(ARM_BSC_SPI_SLAVE_BASE + 0x1C)
 #define ARM_BSC_SPI_SLAVE_MIS	(ARM_BSC_SPI_SLAVE_BASE + 0x20)
 #define ARM_BSC_SPI_SLAVE_ICR	(ARM_BSC_SPI_SLAVE_BASE + 0x24)
+
+//
+// Hardware Random Number Generator
+//
+#define ARM_HW_RNG_BASE		(ARM_IO_BASE + 0x104000)
+
+#define ARM_HW_RNG_CTRL		(ARM_HW_RNG_BASE + 0x00)
+	#define ARM_HW_RNG_CTRL_EN	0x01
+#define ARM_HW_RNG_STATUS	(ARM_HW_RNG_BASE + 0x04)
+#define ARM_HW_RNG_DATA		(ARM_HW_RNG_BASE + 0x08)
 
 #endif
