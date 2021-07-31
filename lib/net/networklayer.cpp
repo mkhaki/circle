@@ -2,7 +2,7 @@
 // networklayer.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2015-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2015-2020  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -21,40 +21,12 @@
 #include <circle/net/checksumcalculator.h>
 #include <circle/net/in.h>
 #include <circle/util.h>
-#include <circle/macros.h>
 #include <assert.h>
-
-struct TIPHeader
-{
-	u8	nVersionIHL;
-#define IP_VERSION			4
-#define IP_HEADER_LENGTH_DWORD_MIN	5
-#define IP_HEADER_LENGTH_DWORD_MAX	6
-	u8	nTypeOfService;
-#define IP_TOS_ROUTINE			0
-	u16	nTotalLength;
-	u16	nIdentification;
-#define IP_IDENTIFICATION_DEFAULT	0
-	u16	nFlagsFragmentOffset;
-#define IP_FRAGMENT_OFFSET(field)	((field) & 0x1F00)
-	#define IP_FRAGMENT_OFFSET_FIRST	0
-#define IP_FLAGS_DF			(1 << 6)	// valid without BE()
-#define IP_FLAGS_MF			(1 << 5)
-	u8	nTTL;
-#define IP_TTL_DEFAULT			64
-	u8	nProtocol;				// see: in.h
-	u16	nHeaderChecksum;
-	u8	SourceAddress[IP_ADDRESS_SIZE];
-	u8	DestinationAddress[IP_ADDRESS_SIZE];
-	//u32	nOptionsPadding;			// optional
-}
-PACKED;
 
 CNetworkLayer::CNetworkLayer (CNetConfig *pNetConfig, CLinkLayer *pLinkLayer)
 :	m_pNetConfig (pNetConfig),
 	m_pLinkLayer (pLinkLayer),
-	m_pICMPHandler (0),
-	m_pBuffer (0)
+	m_pICMPHandler (0)
 {
 	assert (m_pNetConfig != 0);
 	assert (m_pLinkLayer != 0);
@@ -62,9 +34,6 @@ CNetworkLayer::CNetworkLayer (CNetConfig *pNetConfig, CLinkLayer *pLinkLayer)
 
 CNetworkLayer::~CNetworkLayer (void)
 {
-	delete m_pBuffer;
-	m_pBuffer = 0;
-
 	delete m_pICMPHandler;
 	m_pICMPHandler = 0;
 
@@ -75,12 +44,8 @@ CNetworkLayer::~CNetworkLayer (void)
 boolean CNetworkLayer::Initialize (void)
 {
 	assert (m_pICMPHandler == 0);
-	m_pICMPHandler = new CICMPHandler (m_pNetConfig, this, &m_ICMPRxQueue);
+	m_pICMPHandler = new CICMPHandler (m_pNetConfig, this, &m_ICMPRxQueue, &m_ICMPNotificationQueue);
 	assert (m_pICMPHandler != 0);
-
-	assert (m_pBuffer == 0);
-	m_pBuffer = new u8[FRAME_BUFFER_SIZE];
-	assert (m_pBuffer != 0);
 
 	return TRUE;
 }
@@ -91,16 +56,16 @@ void CNetworkLayer::Process (void)
 	const CIPAddress *pOwnIPAddress = m_pNetConfig->GetIPAddress ();
 	assert (pOwnIPAddress != 0);
 
+	u8 Buffer[FRAME_BUFFER_SIZE];
 	unsigned nResultLength;
-	assert (m_pBuffer != 0);
 	assert (m_pLinkLayer != 0);
-	while (m_pLinkLayer->Receive (m_pBuffer, &nResultLength))
+	while (m_pLinkLayer->Receive (Buffer, &nResultLength))
 	{
 		if (nResultLength <= sizeof (TIPHeader))
 		{
 			continue;
 		}
-		TIPHeader *pHeader = (TIPHeader *) m_pBuffer;
+		TIPHeader *pHeader = (TIPHeader *) Buffer;
 
 		unsigned nHeaderLength = pHeader->nVersionIHL & 0xF;
 		if (   nHeaderLength < IP_HEADER_LENGTH_DWORD_MIN
@@ -156,16 +121,17 @@ void CNetworkLayer::Process (void)
 		assert (pParam != 0);
 		pParam->nProtocol = pHeader->nProtocol;
 		memcpy (pParam->SourceAddress, pHeader->SourceAddress, IP_ADDRESS_SIZE);
+		memcpy (pParam->DestinationAddress, pHeader->DestinationAddress, IP_ADDRESS_SIZE);
 
 		nResultLength -= nHeaderLength;
 
 		if (pHeader->nProtocol == IPPROTO_ICMP)
 		{
-			m_ICMPRxQueue.Enqueue ((u8 *) m_pBuffer + nHeaderLength, nResultLength, pParam);
+			m_ICMPRxQueue.Enqueue (Buffer+nHeaderLength, nResultLength, pParam);
 		}
 		else
 		{
-			m_RxQueue.Enqueue ((u8 *) m_pBuffer + nHeaderLength, nResultLength, pParam);
+			m_RxQueue.Enqueue (Buffer+nHeaderLength, nResultLength, pParam);
 		}
 	}
 
@@ -182,9 +148,8 @@ boolean CNetworkLayer::Send (const CIPAddress &rReceiver, const void *pPacket, u
 		return FALSE;
 	}
 
-	u8 *pPacketBuffer = new u8[nPacketLength];
-	assert (pPacketBuffer != 0);
-	TIPHeader *pHeader = (TIPHeader *) pPacketBuffer;
+	u8 PacketBuffer[nPacketLength];
+	TIPHeader *pHeader = (TIPHeader *) PacketBuffer;
 
 	pHeader->nVersionIHL          = IP_VERSION << 4 | IP_HEADER_LENGTH_DWORD_MIN;
 	pHeader->nTypeOfService       = IP_TOS_ROUTINE;
@@ -198,15 +163,6 @@ boolean CNetworkLayer::Send (const CIPAddress &rReceiver, const void *pPacket, u
 	const CIPAddress *pOwnIPAddress = m_pNetConfig->GetIPAddress ();
 	assert (pOwnIPAddress != 0);
 
-	if (   pOwnIPAddress->IsNull ()
-	    && !rReceiver.IsBroadcast ())
-	{
-		delete pPacketBuffer;
-		pPacketBuffer = 0;
-
-		return FALSE;
-	}
-
 	pOwnIPAddress->CopyTo (pHeader->SourceAddress);
 
 	rReceiver.CopyTo (pHeader->DestinationAddress);
@@ -216,32 +172,46 @@ boolean CNetworkLayer::Send (const CIPAddress &rReceiver, const void *pPacket, u
 
 	assert (pPacket != 0);
 	assert (nLength > 0);
-	memcpy (pPacketBuffer+sizeof (TIPHeader), pPacket, nLength);
+	memcpy (PacketBuffer+sizeof (TIPHeader), pPacket, nLength);
 
+	if (   pOwnIPAddress->IsNull ()
+	    && !rReceiver.IsBroadcast ())
+	{
+		SendFailed (ICMP_CODE_DEST_NET_UNREACH, PacketBuffer, nPacketLength);
+
+		return FALSE;
+	}
+
+	CIPAddress GatewayIP;
 	const CIPAddress *pNextHop = &rReceiver;
 	if (!pOwnIPAddress->OnSameNetwork (rReceiver, m_pNetConfig->GetNetMask ()))
 	{
-		pNextHop = m_pNetConfig->GetDefaultGateway ();
-		if (pNextHop->IsNull ())
+		const u8 *pGateway = m_RouteCache.GetRoute (rReceiver.Get ());
+		if (pGateway != 0)
 		{
-			delete pPacketBuffer;
-			pPacketBuffer = 0;
+			GatewayIP.Set (pGateway);
 
-			return FALSE;
+			pNextHop = &GatewayIP;
+		}
+		else
+		{
+			pNextHop = m_pNetConfig->GetDefaultGateway ();
+			if (pNextHop->IsNull ())
+			{
+				SendFailed (ICMP_CODE_DEST_NET_UNREACH, PacketBuffer, nPacketLength);
+
+				return FALSE;
+			}
 		}
 	}
 	
 	assert (m_pLinkLayer != 0);
 	assert (pNextHop != 0);
-	boolean bOK = m_pLinkLayer->Send (*pNextHop, pPacketBuffer, nPacketLength);
-	
-	delete pPacketBuffer;
-	pPacketBuffer = 0;
-
-	return bOK;
+	return m_pLinkLayer->Send (*pNextHop, PacketBuffer, nPacketLength);
 }
 
-boolean CNetworkLayer::Receive (void *pBuffer, unsigned *pResultLength, CIPAddress *pSender, int *pProtocol)
+boolean CNetworkLayer::Receive (void *pBuffer, unsigned *pResultLength,
+				CIPAddress *pSender, CIPAddress *pReceiver, int *pProtocol)
 {
 	void *pParam;
 	assert (pBuffer != 0);
@@ -261,8 +231,71 @@ boolean CNetworkLayer::Receive (void *pBuffer, unsigned *pResultLength, CIPAddre
 	assert (pSender != 0);
 	pSender->Set (pData->SourceAddress);
 
+	assert (pReceiver != 0);
+	pReceiver->Set (pData->DestinationAddress);
+
 	delete pData;
 	pData = 0;
 	
 	return TRUE;
+}
+
+boolean CNetworkLayer::ReceiveNotification (TICMPNotificationType *pType,
+					    CIPAddress *pSender, CIPAddress *pReceiver,
+					    u16 *pSendPort, u16 *pReceivePort,
+					    int *pProtocol)
+{
+	TICMPNotification Notification;
+	unsigned nLength = m_ICMPNotificationQueue.Dequeue (&Notification);
+	if (nLength == 0)
+	{
+		return FALSE;
+	}
+	assert (nLength == sizeof Notification);
+
+	assert (pType != 0);
+	*pType = Notification.Type;
+
+	assert (pProtocol != 0);
+	*pProtocol = Notification.nProtocol;
+
+	assert (pSender != 0);
+	pSender->Set (Notification.SourceAddress);
+
+	assert (pReceiver != 0);
+	pReceiver->Set (Notification.DestinationAddress);
+
+	assert (pSendPort != 0);
+	*pSendPort = Notification.nSourcePort;
+
+	assert (pReceivePort != 0);
+	*pReceivePort = Notification.nDestinationPort;
+
+	return TRUE;
+}
+
+void CNetworkLayer::AddRoute (const u8 *pDestIP, const u8 *pGatewayIP)
+{
+	m_RouteCache.AddRoute (pDestIP, pGatewayIP);
+}
+
+const u8 *CNetworkLayer::GetGateway (const u8 *pDestIP) const
+{
+	const u8 *pGateway = m_RouteCache.GetRoute (pDestIP);
+	if (pGateway != 0)
+	{
+		return pGateway;
+	}
+
+	assert (m_pNetConfig != 0);
+	const CIPAddress *pDefaultGateway = m_pNetConfig->GetDefaultGateway ();
+	assert (pDefaultGateway != 0);
+
+	return pDefaultGateway->Get ();
+}
+
+void CNetworkLayer::SendFailed (unsigned nICMPCode, const void *pReturnedPacket, unsigned nLength)
+{
+	assert (m_pICMPHandler != 0);
+	m_pICMPHandler->DestinationUnreachable (nICMPCode, pReturnedPacket, nLength);
 }

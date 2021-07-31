@@ -2,37 +2,54 @@
  * circle.ld
  */
 
+ENTRY(_start)
+
 SECTIONS
 {
-	. = 0x8000;
-	
-	.text : {
-		*(.text*)
+	.init : {
+		*(.init)
 	}
 
-	_etext = .;
+	.text : {
+		*(.text*)
+
+		_etext = .;
+	}
 
 	.rodata : {
 		*(.rodata*)
 	}
 
-	__init_start = .;
-
 	.init_array : {
-		*(.init_array*)
+		__init_start = .;
+
+		KEEP(*(.init_array*))
+
+		__init_end = .;
 	}
 
-	__init_end = .;
+	.ARM.exidx : {
+		__exidx_start = .;
+
+		*(.ARM.exidx*)
+
+		__exidx_end = .;
+	}
+
+	.eh_frame : {
+		*(.eh_frame*)
+	}
 
 	.data : {
 		*(.data*)
 	}
 
-	__bss_start = .;
-
 	.bss : {
-		*(.bss*)
-	}
+		__bss_start = .;
 
-	_end = .;
+		*(.bss*)
+		*(COMMON)
+
+		_end = .;
+	}
 }

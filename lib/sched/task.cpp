@@ -2,7 +2,7 @@
 // task.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2015-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2015-2021  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -22,15 +22,25 @@
 #include <circle/util.h>
 #include <assert.h>
 
-CTask::CTask (unsigned nStackSize)
-:	m_State (TaskStateReady),
+CTask::CTask (unsigned nStackSize, boolean bCreateSuspended)
+:	m_State (bCreateSuspended ? TaskStateNew : TaskStateReady),
 	m_nStackSize (nStackSize),
-	m_pStack (0)
+	m_pStack (0),
+	m_pWaitListNext (0)
 {
+	for (unsigned i = 0; i < TASK_USER_DATA_SLOTS; i++)
+	{
+		m_pUserData[i] = 0;
+	}
+
 	if (m_nStackSize != 0)
 	{
 		assert (m_nStackSize >= 1024);
+#if AARCH == 32
 		assert ((m_nStackSize & 3) == 0);
+#else
+		assert ((m_nStackSize & 15) == 0);
+#endif
 		m_pStack = new u8[m_nStackSize];
 		assert (m_pStack != 0);
 
@@ -49,10 +59,50 @@ CTask::~CTask (void)
 	m_pStack = 0;
 }
 
+void CTask::Start (void)
+{
+	assert(m_State == TaskStateNew);
+	m_State = TaskStateReady;
+}
+
 void CTask::Run (void)		// dummy method which is never called
 {
 	assert (0);
 }
+
+void CTask::Terminate (void)
+{
+	m_State = TaskStateTerminated;
+	m_Event.Set ();
+	CScheduler::Get ()->Yield ();
+
+	assert (0);
+}
+
+void CTask::WaitForTermination (void)
+{
+	// Before accessing any of our member variables
+	// make sure this task object hasn't been deleted by 
+	// checking it's still registered with the scheduler
+	if (!CScheduler::Get()->IsValidTask (this))
+	{
+		return;
+	}
+
+	m_Event.Wait ();
+}
+
+void CTask::SetUserData (void *pData, unsigned nSlot)
+{
+	m_pUserData[nSlot] = pData;
+}
+
+void *CTask::GetUserData (unsigned nSlot)
+{
+	return m_pUserData[nSlot];
+}
+
+#if AARCH == 32
 
 void CTask::InitializeRegs (void)
 {
@@ -64,7 +114,32 @@ void CTask::InitializeRegs (void)
 	m_Regs.sp = (u32) m_pStack + m_nStackSize;
 
 	m_Regs.lr = (u32) &TaskEntry;
+
+#define VFP_FPEXC_EN	(1 << 30)
+	m_Regs.fpexc = VFP_FPEXC_EN;
+#define VFP_FPSCR_DN	(1 << 25)	// enable Default NaN mode
+	m_Regs.fpscr = VFP_FPSCR_DN;
 }
+
+#else
+
+void CTask::InitializeRegs (void)
+{
+	memset (&m_Regs, 0, sizeof m_Regs);
+
+	m_Regs.x0 = (u64) this;		// pParam for TaskEntry()
+
+	assert (m_pStack != 0);
+	m_Regs.sp = (u64) m_pStack + m_nStackSize;
+
+	m_Regs.x30 = (u64) &TaskEntry;
+
+	u32 nFPCR;
+	asm volatile ("mrs %0, fpcr" : "=r" (nFPCR));
+	m_Regs.fpcr = nFPCR;
+}
+
+#endif
 
 void CTask::TaskEntry (void *pParam)
 {
@@ -74,6 +149,7 @@ void CTask::TaskEntry (void *pParam)
 	pThis->Run ();
 
 	pThis->m_State = TaskStateTerminated;
+	pThis->m_Event.Set ();
 	CScheduler::Get ()->Yield ();
 
 	assert (0);

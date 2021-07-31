@@ -2,7 +2,7 @@
 // udpconnection.h
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2015-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2015-2018  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -24,7 +24,9 @@
 #include <circle/net/netconnection.h>
 #include <circle/net/networklayer.h>
 #include <circle/net/ipaddress.h>
+#include <circle/net/icmphandler.h>
 #include <circle/net/netqueue.h>
+#include <circle/sched/synchronizationevent.h>
 #include <circle/types.h>
 
 class CUDPConnection : public CNetConnection
@@ -50,17 +52,31 @@ public:
 	int SendTo (const void *pData, unsigned nLength, int nFlags, CIPAddress	&rForeignIP, u16 nForeignPort);
 	int ReceiveFrom (void *pBuffer, int nFlags, CIPAddress *pForeignIP, u16 *pForeignPort);
 
+	int SetOptionBroadcast (boolean bAllowed);
+
+	boolean IsConnected (void) const;
 	boolean IsTerminated (void) const;
 	
 	void Process (void);
 
 	// returns: -1: invalid packet, 0: not to me, 1: packet consumed
-	int PacketReceived (const void *pPacket, unsigned nLength, CIPAddress &rSenderIP, int nProtocol);
+	int PacketReceived (const void *pPacket, unsigned nLength,
+			    CIPAddress &rSenderIP, CIPAddress &rReceiverIP, int nProtocol);
+
+	// returns: 0: not to me, 1: notification consumed
+	int NotificationReceived (TICMPNotificationType Type,
+				  CIPAddress &rSenderIP, CIPAddress &rReceiverIP,
+				  u16 nSendPort, u16 nReceivePort,
+				  int nProtocol);
 
 private:
 	boolean m_bOpen;
 	boolean m_bActiveOpen;
 	CNetQueue m_RxQueue;
+	CSynchronizationEvent m_Event;
+	boolean m_bBroadcastsAllowed;
+
+	int m_nErrno;				// signalize error to the user
 };
 
 #endif

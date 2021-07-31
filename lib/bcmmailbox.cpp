@@ -2,7 +2,7 @@
 // bcmmailbox.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014-2015  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2019  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -23,9 +23,11 @@
 #include <circle/timer.h>
 #include <assert.h>
 
-CBcmMailBox::CBcmMailBox (unsigned nChannel)
+CSpinLock CBcmMailBox::s_SpinLock (TASK_LEVEL);
+
+CBcmMailBox::CBcmMailBox (unsigned nChannel, boolean bEarlyUse)
 :	m_nChannel (nChannel),
-	m_SpinLock (FALSE)
+	m_bEarlyUse (bEarlyUse)
 {
 }
 
@@ -33,60 +35,66 @@ CBcmMailBox::~CBcmMailBox (void)
 {
 }
 
-unsigned CBcmMailBox::WriteRead (unsigned nData)
+u32 CBcmMailBox::WriteRead (u32 nData)
 {
-	DataMemBarrier ();
+	PeripheralEntry ();
 
-	m_SpinLock.Acquire ();
+	if (!m_bEarlyUse)
+	{
+		s_SpinLock.Acquire ();
+	}
 
 	Flush ();
 
 	Write (nData);
 
-	unsigned nResult = Read ();
+	u32 nResult = Read ();
 
-	m_SpinLock.Release ();
+	if (!m_bEarlyUse)
+	{
+		s_SpinLock.Release ();
+	}
 
-	DataMemBarrier ();
+	PeripheralExit ();
 
 	return nResult;
 }
 
 void CBcmMailBox::Flush (void)
 {
-	while (!(read32 (MAILBOX_STATUS) & MAILBOX_STATUS_EMPTY))
+	while (!(read32 (MAILBOX0_STATUS) & MAILBOX_STATUS_EMPTY))
 	{
-		read32 (MAILBOX_READ);
+		read32 (MAILBOX0_READ);
 
 		CTimer::SimpleMsDelay (20);
 	}
 }
 
-unsigned CBcmMailBox::Read (void)
+u32 CBcmMailBox::Read (void)
 {
-	unsigned nResult;
+	u32 nResult;
 	
 	do
 	{
-		while (read32 (MAILBOX_STATUS) & MAILBOX_STATUS_EMPTY)
+		while (read32 (MAILBOX0_STATUS) & MAILBOX_STATUS_EMPTY)
 		{
 			// do nothing
 		}
 		
-		nResult = read32 (MAILBOX_READ);
+		nResult = read32 (MAILBOX0_READ);
 	}
 	while ((nResult & 0xF) != m_nChannel);		// channel number is in the lower 4 bits
 
 	return nResult & ~0xF;
 }
 
-void CBcmMailBox::Write (unsigned nData)
+void CBcmMailBox::Write (u32 nData)
 {
-	while (read32 (MAILBOX_STATUS) & MAILBOX_STATUS_FULL)
+	while (read32 (MAILBOX1_STATUS) & MAILBOX_STATUS_FULL)
 	{
 		// do nothing
 	}
 
 	assert ((nData & 0xF) == 0);
-	write32 (MAILBOX_WRITE, m_nChannel | nData);	// channel number is in the lower 4 bits
+	write32 (MAILBOX1_WRITE, m_nChannel | nData);	// channel number is in the lower 4 bits
 }

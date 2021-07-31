@@ -2,7 +2,7 @@
 // bcm2835.h
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2021  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -24,9 +24,12 @@
 
 #if RASPPI == 1
 #define ARM_IO_BASE		0x20000000
-#else
+#elif RASPPI <= 3
 #define ARM_IO_BASE		0x3F000000
+#else
+#define ARM_IO_BASE		0xFE000000
 #endif
+#define ARM_IO_END		(ARM_IO_BASE + 0xFFFFFF)
 
 #define GPU_IO_BASE		0x7E000000
 
@@ -42,6 +45,9 @@
 #else
 	#define GPU_MEM_BASE	GPU_UNCACHED_BASE
 #endif
+
+// Convert ARM address to GPU bus address (does also work for aliases)
+#define BUS_ADDRESS(addr)	(((addr) & ~0xC0000000) | GPU_MEM_BASE)
 
 //
 // General Purpose I/O
@@ -61,8 +67,16 @@
 #define ARM_GPIO_GPLEN0		(ARM_GPIO_BASE + 0x70)
 #define ARM_GPIO_GPAREN0	(ARM_GPIO_BASE + 0x7C)
 #define ARM_GPIO_GPAFEN0	(ARM_GPIO_BASE + 0x88)
+#if RASPPI <= 3
 #define ARM_GPIO_GPPUD		(ARM_GPIO_BASE + 0x94)
 #define ARM_GPIO_GPPUDCLK0	(ARM_GPIO_BASE + 0x98)
+#else
+#define ARM_GPIO_GPPINMUXSD	(ARM_GPIO_BASE + 0xD0)
+#define ARM_GPIO_GPPUPPDN0	(ARM_GPIO_BASE + 0xE4)
+#define ARM_GPIO_GPPUPPDN1	(ARM_GPIO_BASE + 0xE8)
+#define ARM_GPIO_GPPUPPDN2	(ARM_GPIO_BASE + 0xEC)
+#define ARM_GPIO_GPPUPPDN3	(ARM_GPIO_BASE + 0xF0)
+#endif
 
 //
 // UART0
@@ -135,11 +149,12 @@
 //
 #define MAILBOX_BASE		(ARM_IO_BASE + 0xB880)
 
-#define MAILBOX_READ  		MAILBOX_BASE
-#define MAILBOX_STATUS 		(MAILBOX_BASE + 0x18)
+#define MAILBOX0_READ  		(MAILBOX_BASE + 0x00)
+#define MAILBOX0_STATUS 	(MAILBOX_BASE + 0x18)
 	#define MAILBOX_STATUS_EMPTY	0x40000000
+#define MAILBOX1_WRITE		(MAILBOX_BASE + 0x20)
+#define MAILBOX1_STATUS 	(MAILBOX_BASE + 0x38)
 	#define MAILBOX_STATUS_FULL	0x80000000
-#define MAILBOX_WRITE		(MAILBOX_BASE + 0x20)
 
 #define MAILBOX_CHANNEL_PM	0			// power management
 #define MAILBOX_CHANNEL_FB 	1			// frame buffer
@@ -158,6 +173,19 @@
 #define ARM_PWM_FIF1		(ARM_PWM_BASE + 0x18)
 #define ARM_PWM_RNG2		(ARM_PWM_BASE + 0x20)
 #define ARM_PWM_DAT2		(ARM_PWM_BASE + 0x24)
+
+#if RASPPI >= 4
+#define ARM_PWM1_BASE		(ARM_IO_BASE + 0x20C800)
+
+#define ARM_PWM1_CTL		(ARM_PWM1_BASE + 0x00)
+#define ARM_PWM1_STA		(ARM_PWM1_BASE + 0x04)
+#define ARM_PWM1_DMAC		(ARM_PWM1_BASE + 0x08)
+#define ARM_PWM1_RNG1		(ARM_PWM1_BASE + 0x10)
+#define ARM_PWM1_DAT1		(ARM_PWM1_BASE + 0x14)
+#define ARM_PWM1_FIF1		(ARM_PWM1_BASE + 0x18)
+#define ARM_PWM1_RNG2		(ARM_PWM1_BASE + 0x20)
+#define ARM_PWM1_DAT2		(ARM_PWM1_BASE + 0x24)
+#endif
 
 //
 // Clock Manager
@@ -184,14 +212,29 @@
 #define ARM_EMMC_BASE		(ARM_IO_BASE + 0x300000)
 
 //
-// Power Manager (?)
+// SDHOST Controller (SD Card)
+//
+#define ARM_SDHOST_BASE		(ARM_IO_BASE + 0x202000)
+
+//
+// Power Manager
 //
 #define ARM_PM_BASE		(ARM_IO_BASE + 0x100000)
 
 #define ARM_PM_RSTC		(ARM_PM_BASE + 0x1C)
 #define ARM_PM_WDOG		(ARM_PM_BASE + 0x24)
+#define ARM_PM_PADS0		(ARM_PM_BASE + 0x2C)    // GPIO 0 - 27
+#define ARM_PM_PADS1		(ARM_PM_BASE + 0x30)    // GPIO 28 - 45
+#define ARM_PM_PADS2		(ARM_PM_BASE + 0x34)    // GPIO 46 - 53
 
 #define ARM_PM_PASSWD		(0x5A << 24)
+#define ARM_PM_RSTC_CLEAR	0xFFFFFFCF
+#define ARM_PM_RSTC_REBOOT	0x00000020
+#define ARM_PM_RSTC_RESET	0x00000102
+#define ARM_PM_WDOG_TIME	0x000FFFFF
+#define ARM_PADS_SLEW		(0x01 << 4)
+#define ARM_PADS_HYST		(0x01 << 3)
+#define ARM_PADS_DRIVE(val)	((val) & 0x3)
 
 //
 // BSC Master
@@ -237,6 +280,20 @@
 #define ARM_BSC_SPI_SLAVE_ICR	(ARM_BSC_SPI_SLAVE_BASE + 0x24)
 
 //
+// Auxiliary Peripherals
+//
+#define ARM_AUX_BASE		(ARM_IO_BASE + 0x215000)
+
+#define ARM_AUX_ENABLE		(ARM_AUX_BASE + 0x04)
+	#define ARM_AUX_ENABLE_SPI1	0x02
+
+#define ARM_AUX_SPI0_CNTL0	(ARM_AUX_BASE + 0x80)
+#define ARM_AUX_SPI0_CNTL1	(ARM_AUX_BASE + 0x84)
+#define ARM_AUX_SPI0_STAT	(ARM_AUX_BASE + 0x88)
+#define ARM_AUX_SPI0_IO		(ARM_AUX_BASE + 0xA0)
+#define ARM_AUX_SPI0_TXHOLD	(ARM_AUX_BASE + 0xB0)
+
+//
 // Hardware Random Number Generator
 //
 #define ARM_HW_RNG_BASE		(ARM_IO_BASE + 0x104000)
@@ -245,5 +302,39 @@
 	#define ARM_HW_RNG_CTRL_EN	0x01
 #define ARM_HW_RNG_STATUS	(ARM_HW_RNG_BASE + 0x04)
 #define ARM_HW_RNG_DATA		(ARM_HW_RNG_BASE + 0x08)
+
+//
+// PCM / I2S Audio Module
+//
+#define ARM_PCM_BASE		(ARM_IO_BASE + 0x203000)
+
+#define ARM_PCM_CS_A		(ARM_PCM_BASE + 0x00)
+#define ARM_PCM_FIFO_A		(ARM_PCM_BASE + 0x04)
+#define ARM_PCM_MODE_A		(ARM_PCM_BASE + 0x08)
+#define ARM_PCM_RXC_A		(ARM_PCM_BASE + 0x0C)
+#define ARM_PCM_TXC_A		(ARM_PCM_BASE + 0x10)
+#define ARM_PCM_DREQ_A		(ARM_PCM_BASE + 0x14)
+#define ARM_PCM_INTEN_A		(ARM_PCM_BASE + 0x18)
+#define ARM_PCM_INTSTC_A	(ARM_PCM_BASE + 0x1C)
+#define ARM_PCM_GRAY		(ARM_PCM_BASE + 0x20)
+
+//
+// VC4 VCHIQ
+//
+#define ARM_VCHIQ_BASE		(ARM_IO_BASE + 0xB840)
+#define ARM_VCHIQ_END		(ARM_VCHIQ_BASE + 0x0F)
+
+//
+// VC4/5 HDMI
+//
+#if RASPPI <= 3
+#define ARM_HDMI_BASE		(ARM_IO_BASE + 0x902000)
+#define ARM_HD_BASE		(ARM_IO_BASE + 0x808000)
+#else
+#define ARM_HDMI_BASE		(ARM_IO_BASE + 0xF00700)
+#define ARM_HD_BASE		(ARM_IO_BASE + 0xF20000)
+#define ARM_PHY_BASE		(ARM_IO_BASE + 0xF00F00)
+#define ARM_RAM_BASE		(ARM_IO_BASE + 0xF01B00)
+#endif
 
 #endif

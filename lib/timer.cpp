@@ -2,7 +2,7 @@
 // timer.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2021  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -19,11 +19,16 @@
 //
 #include <circle/timer.h>
 #include <circle/bcm2835.h>
+#include <circle/bcm2836.h>
 #include <circle/memio.h>
 #include <circle/synchronize.h>
 #include <circle/logger.h>
 #include <circle/debug.h>
 #include <assert.h>
+
+#if RASPPI >= 4 && !defined (USE_PHYSICAL_COUNTER)
+	#error USE_PHYSICAL_COUNTER is required on Raspberry Pi 4!
+#endif
 
 struct TKernelTimer
 {
@@ -53,8 +58,10 @@ CTimer::CTimer (CInterruptSystem *pInterruptSystem)
 	m_nUptime (0),
 	m_nTime (0),
 	m_nMinutesDiff (0),
-	m_nMsDelay (350000),
-	m_nusDelay (m_nMsDelay / 1000)
+	m_nMsDelay (200000),
+	m_nusDelay (m_nMsDelay / 1000),
+	m_pUpdateTimeHandler (0),
+	m_nPeriodicHandlers (0)
 {
 	assert (s_pThis == 0);
 	s_pThis = this;
@@ -63,7 +70,17 @@ CTimer::CTimer (CInterruptSystem *pInterruptSystem)
 CTimer::~CTimer (void)
 {
 	assert (m_pInterruptSystem != 0);
+#ifndef USE_PHYSICAL_COUNTER
 	m_pInterruptSystem->DisconnectIRQ (ARM_IRQ_TIMER3);
+#else
+#if AARCH == 32
+	asm volatile ("mcr p15, 0, %0, c14, c2, 1" :: "r" (0));
+#else
+	asm volatile ("msr CNTP_CTL_EL0, %0" :: "r" (0));
+#endif
+
+	m_pInterruptSystem->DisconnectIRQ (ARM_IRQLOCAL0_CNTPNS);
+#endif
 
 	TPtrListElement *pElement;
 	while ((pElement = m_KernelTimerList.GetFirst ()) != 0)
@@ -83,17 +100,65 @@ CTimer::~CTimer (void)
 boolean CTimer::Initialize (void)
 {
 	assert (m_pInterruptSystem != 0);
+#ifndef USE_PHYSICAL_COUNTER
 	m_pInterruptSystem->ConnectIRQ (ARM_IRQ_TIMER3, InterruptHandler, this);
 
-	DataMemBarrier ();
+	PeripheralEntry ();
 
 	write32 (ARM_SYSTIMER_CLO, -(30 * CLOCKHZ));	// timer wraps soon, to check for problems
 
 	write32 (ARM_SYSTIMER_C3, read32 (ARM_SYSTIMER_CLO) + CLOCKHZ / HZ);
-	
-	TuneMsDelay ();
+#else
+	m_pInterruptSystem->ConnectIRQ (ARM_IRQLOCAL0_CNTPNS, InterruptHandler, this);
 
-	DataMemBarrier ();
+#if AARCH == 32
+	u32 nCNTPCTLow, nCNTPCTHigh;
+	asm volatile ("mrrc p15, 0, %0, %1, c14" : "=r" (nCNTPCTLow), "=r" (nCNTPCTHigh));
+
+	u64 nCNTP_CVAL = ((u64) nCNTPCTHigh << 32 | nCNTPCTLow) + CLOCKHZ / HZ;
+	asm volatile ("mcrr p15, 2, %0, %1, c14" :: "r" (nCNTP_CVAL & 0xFFFFFFFFU),
+						    "r" (nCNTP_CVAL >> 32));
+
+	asm volatile ("mcr p15, 0, %0, c14, c2, 1" :: "r" (1));
+#else
+	u64 nCNTFRQ;
+	asm volatile ("mrs %0, CNTFRQ_EL0" : "=r" (nCNTFRQ));
+	assert (nCNTFRQ % HZ == 0);
+	m_nClockTicksPerHZTick = nCNTFRQ / HZ;
+
+	u64 nCNTPCT;
+	asm volatile ("mrs %0, CNTPCT_EL0" : "=r" (nCNTPCT));
+	asm volatile ("msr CNTP_CVAL_EL0, %0" :: "r" (nCNTPCT + m_nClockTicksPerHZTick));
+
+	asm volatile ("msr CNTP_CTL_EL0, %0" :: "r" (1));
+#endif
+#endif
+	
+#ifdef CALIBRATE_DELAY
+	TuneMsDelay ();
+#endif
+
+#if defined (USE_PHYSICAL_COUNTER) && AARCH == 32
+	u32 nCNTFRQ;
+	asm volatile ("mrc p15, 0, %0, c14, c0, 0" : "=r" (nCNTFRQ));
+
+	u32 nPrescaler = read32 (ARM_LOCAL_PRESCALER);
+
+#if RASPPI <= 3
+	if (   nCNTFRQ    != 19200000
+	    || nPrescaler != 0x6AAAAAB)
+#else
+	if (   nCNTFRQ    != 54000000
+	    || nPrescaler != 39768216U)
+#endif
+	{
+		CLogger::Get ()->Write (FromTimer, LogPanic,
+					"USE_PHYSICAL_COUNTER is not supported (freq %u, pre 0x%X)",
+					nCNTFRQ, nPrescaler);
+	}
+#endif
+
+	PeripheralExit ();
 
 	return TRUE;
 }
@@ -117,9 +182,10 @@ int CTimer::GetTimeZone (void) const
 
 boolean CTimer::SetTime (unsigned nTime, boolean bLocal)
 {
+	int nSecondsDiff = m_nMinutesDiff * 60;
+
 	if (!bLocal)
 	{
-		int nSecondsDiff = m_nMinutesDiff * 60;
 		if (    nSecondsDiff < 0
 		    && -nSecondsDiff > (int) nTime)
 		{
@@ -127,6 +193,12 @@ boolean CTimer::SetTime (unsigned nTime, boolean bLocal)
 		}
 
 		nTime += nSecondsDiff;
+	}
+
+	if (   m_pUpdateTimeHandler != 0
+	    && !(*m_pUpdateTimeHandler) (nTime - nSecondsDiff, GetUniversalTime ()))
+	{
+		return FALSE;
 	}
 
 	m_TimeSpinLock.Acquire ();
@@ -138,15 +210,35 @@ boolean CTimer::SetTime (unsigned nTime, boolean bLocal)
 	return TRUE;
 }
 
-unsigned CTimer::GetClockTicks (void) const
+unsigned CTimer::GetClockTicks (void)
 {
-	DataMemBarrier ();
+#ifndef USE_PHYSICAL_COUNTER
+	PeripheralEntry ();
 
 	unsigned nResult = read32 (ARM_SYSTIMER_CLO);
 
-	DataMemBarrier ();
+	PeripheralExit ();
 
 	return nResult;
+#else
+#if AARCH == 32
+	InstructionSyncBarrier ();
+
+	u32 nCNTPCTLow, nCNTPCTHigh;
+	asm volatile ("mrrc p15, 0, %0, %1, c14" : "=r" (nCNTPCTLow), "=r" (nCNTPCTHigh));
+
+	return nCNTPCTLow;
+#else
+	InstructionSyncBarrier ();
+
+	u64 nCNTPCT;
+	asm volatile ("mrs %0, CNTPCT_EL0" : "=r" (nCNTPCT));
+	u64 nCNTFRQ;
+	asm volatile ("mrs %0, CNTFRQ_EL0" : "=r" (nCNTFRQ));
+
+	return (unsigned) (nCNTPCT * CLOCKHZ / nCNTFRQ);
+#endif
+#endif
 }
 
 unsigned CTimer::GetTicks (void) const
@@ -164,6 +256,24 @@ unsigned CTimer::GetTime (void) const
 	return m_nTime;
 }
 
+boolean CTimer::GetLocalTime (unsigned *pSeconds, unsigned *pMicroSeconds)
+{
+	m_TimeSpinLock.Acquire ();
+
+	unsigned nTime = m_nTime;
+	unsigned nTicks = m_nTicks;
+
+	m_TimeSpinLock.Release ();
+
+	assert (pSeconds != 0);
+	*pSeconds = nTime;
+
+	assert (pMicroSeconds != 0);
+	*pMicroSeconds = nTicks % HZ * (1000000 / HZ);
+
+	return TRUE;
+}
+
 unsigned CTimer::GetUniversalTime (void) const
 {
 	unsigned nResult = m_nTime;
@@ -175,6 +285,30 @@ unsigned CTimer::GetUniversalTime (void) const
 	}
 
 	return nResult - nSecondsDiff;
+}
+
+boolean CTimer::GetUniversalTime (unsigned *pSeconds, unsigned *pMicroSeconds)
+{
+	m_TimeSpinLock.Acquire ();
+
+	unsigned nTime = m_nTime;
+	unsigned nTicks = m_nTicks;
+
+	m_TimeSpinLock.Release ();
+
+	int nSecondsDiff = m_nMinutesDiff * 60;
+	if (nSecondsDiff > (int) nTime)
+	{
+		return FALSE;
+	}
+
+	assert (pSeconds != 0);
+	*pSeconds = nTime - nSecondsDiff;
+
+	assert (pMicroSeconds != 0);
+	*pMicroSeconds = nTicks % HZ * (1000000 / HZ);
+
+	return TRUE;
 }
 
 CString *CTimer::GetTimeString (void)
@@ -248,10 +382,10 @@ CString *CTimer::GetTimeString (void)
 	return pString;
 }
 
-unsigned CTimer::StartKernelTimer (unsigned nDelay,
-				   TKernelTimerHandler *pHandler,
-				   void *pParam,
-				   void *pContext)
+TKernelTimerHandle CTimer::StartKernelTimer (unsigned nDelay,
+					     TKernelTimerHandler *pHandler,
+					     void *pParam,
+					     void *pContext)
 {
 	TKernelTimer *pTimer = new TKernelTimer;
 	assert (pTimer != 0);
@@ -297,10 +431,10 @@ unsigned CTimer::StartKernelTimer (unsigned nDelay,
 
 	m_KernelTimerSpinLock.Release ();
 
-	return (unsigned) pTimer;
+	return (TKernelTimerHandle) pTimer;
 }
 
-void CTimer::CancelKernelTimer (unsigned hTimer)
+void CTimer::CancelKernelTimer (TKernelTimerHandle hTimer)
 {
 	TKernelTimer *pTimer = (TKernelTimer *) hTimer;
 	assert (pTimer != 0);
@@ -347,7 +481,7 @@ void CTimer::PollKernelTimers (void)
 
 		TKernelTimerHandler *pHandler = pTimer->m_pHandler;
 		assert (pHandler != 0);
-		(*pHandler) ((unsigned) pTimer, pTimer->m_pParam, pTimer->m_pContext);
+		(*pHandler) ((TKernelTimerHandle) pTimer, pTimer->m_pParam, pTimer->m_pContext);
 
 #ifndef NDEBUG
 		pTimer->m_nMagic = 0;
@@ -362,21 +496,35 @@ void CTimer::PollKernelTimers (void)
 
 void CTimer::InterruptHandler (void)
 {
-	DataMemBarrier ();
+#ifndef USE_PHYSICAL_COUNTER
+	PeripheralEntry ();
 
-	assert (read32 (ARM_SYSTIMER_CS) & (1 << 3));
-	
-	u32 nCompare = read32 (ARM_SYSTIMER_C3) + CLOCKHZ / HZ;
-	write32 (ARM_SYSTIMER_C3, nCompare);
-	if (nCompare < read32 (ARM_SYSTIMER_CLO))			// time may drift
+	u32 nCompare = read32 (ARM_SYSTIMER_C3);
+	do
 	{
-		nCompare = read32 (ARM_SYSTIMER_CLO) + CLOCKHZ / HZ;
+		nCompare += CLOCKHZ / HZ;
+
 		write32 (ARM_SYSTIMER_C3, nCompare);
 	}
+	while ((int) (nCompare - read32 (ARM_SYSTIMER_CLO)) < 2);	// time may drift
 
 	write32 (ARM_SYSTIMER_CS, 1 << 3);
 
-	DataMemBarrier ();
+	PeripheralExit ();
+#else
+#if AARCH == 32
+	u32 nCNTP_CVALLow, nCNTP_CVALHigh;
+	asm volatile ("mrrc p15, 2, %0, %1, c14" : "=r" (nCNTP_CVALLow), "=r" (nCNTP_CVALHigh));
+
+	u64 nCNTP_CVAL = ((u64) nCNTP_CVALHigh << 32 | nCNTP_CVALLow) + CLOCKHZ / HZ;
+	asm volatile ("mcrr p15, 2, %0, %1, c14" :: "r" (nCNTP_CVAL & 0xFFFFFFFFU),
+						    "r" (nCNTP_CVAL >> 32));
+#else
+	u64 nCNTP_CVAL;
+	asm volatile ("mrs %0, CNTP_CVAL_EL0" : "=r" (nCNTP_CVAL));
+	asm volatile ("msr CNTP_CVAL_EL0, %0" :: "r" (nCNTP_CVAL + m_nClockTicksPerHZTick));
+#endif
+#endif
 
 #ifndef NDEBUG
 	//debug_click ();
@@ -393,6 +541,11 @@ void CTimer::InterruptHandler (void)
 	m_TimeSpinLock.Release ();
 
 	PollKernelTimers ();
+
+	for (unsigned i = 0; i < m_nPeriodicHandlers; i++)
+	{
+		(*m_pPeriodicHandler[i]) ();
+	}
 }
 
 void CTimer::InterruptHandler (void *pParam)
@@ -403,30 +556,10 @@ void CTimer::InterruptHandler (void *pParam)
 	pThis->InterruptHandler ();
 }
 
-void CTimer::MsDelay (unsigned nMilliSeconds)
-{
-	if (nMilliSeconds > 0)
-	{
-		unsigned nCycles =  m_nMsDelay * nMilliSeconds;
-
-		DelayLoop (nCycles);
-	}
-}
-
-void CTimer::usDelay (unsigned nMicroSeconds)
-{
-	if (nMicroSeconds > 0)
-	{
-		unsigned nCycles =  m_nusDelay * nMicroSeconds;
-
-		DelayLoop (nCycles);
-	}
-}
-
 void CTimer::TuneMsDelay (void)
 {
 	unsigned nTicks = GetTicks ();
-	MsDelay (1000);
+	DelayLoop (m_nMsDelay * 1000);
 	nTicks = GetTicks () - nTicks;
 
 	unsigned nFactor = 100 * HZ / nTicks;
@@ -436,6 +569,25 @@ void CTimer::TuneMsDelay (void)
 
 	CLogger::Get ()->Write (FromTimer, LogNotice, "SpeedFactor is %u.%02u",
 				nFactor / 100, nFactor % 100);
+}
+
+void CTimer::RegisterUpdateTimeHandler (TUpdateTimeHandler *pHandler)
+{
+	assert (m_pUpdateTimeHandler == 0);
+	m_pUpdateTimeHandler = pHandler;
+	assert (m_pUpdateTimeHandler != 0);
+}
+
+void CTimer::RegisterPeriodicHandler (TPeriodicTimerHandler *pHandler)
+{
+	assert (pHandler != 0);
+
+	assert (m_nPeriodicHandlers < TIMER_MAX_PERIODIC_HANDLERS);
+	m_pPeriodicHandler[m_nPeriodicHandlers] = pHandler;
+
+	DataSyncBarrier ();
+
+	m_nPeriodicHandlers++;
 }
 
 void CTimer::SimpleMsDelay (unsigned nMilliSeconds)
@@ -450,9 +602,10 @@ void CTimer::SimpleusDelay (unsigned nMicroSeconds)
 {
 	if (nMicroSeconds > 0)
 	{
-		unsigned nTicks = nMicroSeconds * (CLOCKHZ / 1000000);
+		unsigned nTicks = nMicroSeconds * (CLOCKHZ / 1000000) + 1;
 
-		DataMemBarrier ();
+#ifndef USE_PHYSICAL_COUNTER
+		PeripheralEntry ();
 
 		unsigned nStartTicks = read32 (ARM_SYSTIMER_CLO);
 		while (read32 (ARM_SYSTIMER_CLO) - nStartTicks < nTicks)
@@ -460,7 +613,14 @@ void CTimer::SimpleusDelay (unsigned nMicroSeconds)
 			// do nothing
 		}
 
-		DataMemBarrier ();
+		PeripheralExit ();
+#else
+		unsigned nStartTicks = GetClockTicks ();
+		while (GetClockTicks () - nStartTicks < nTicks)
+		{
+			// do nothing
+		}
+#endif
 	}
 }
 

@@ -13,7 +13,7 @@
 //	user timeout
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2015-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2015-2021  R. Stange <rsta2@o2online.de>
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -37,6 +37,8 @@
 
 //#define TCP_DEBUG
 
+#define TCP_MAX_CONNECTIONS		1000	// maximum number of active TCP connections
+
 #define MSS_R				1480	// maximum segment size to be received from network layer
 #define MSS_S				1480	// maximum segment size to be send to network layer
 
@@ -49,6 +51,7 @@
 #define TCP_QUIET_TIME			30	// seconds after crash before another connection starts
 
 #define HZ_TIMEWAIT			(60 * HZ)
+#define HZ_FIN_TIMEOUT			(60 * HZ)	// timeout in FIN-WAIT-2 state
 
 #define MAX_RETRANSMISSIONS		5
 
@@ -73,7 +76,7 @@ struct TTCPHeader
 	u16	nWindow;
 	u16	nChecksum;
 	u16	nUrgentPointer;
-	u32	Options[0];
+	u32	Options[];
 }
 PACKED;
 
@@ -89,7 +92,7 @@ struct TTCPOption
 #define TCP_OPTION_SACK_PERM	4	//	None
 #define TCP_OPTION_TIMESTAMP	8	//	Timestamp value, Timestamp echo reply (2*4 byte)
 	u8	nLength;
-	u8	Data[0];
+	u8	Data[];
 }
 PACKED;
 
@@ -119,6 +122,8 @@ PACKED;
 	#define UNEXPECTED_STATE()	((void) 0)
 #endif
 
+unsigned CTCPConnection::s_nConnections = 0;
+
 static const char FromTCP[] = "tcp";
 
 CTCPConnection::CTCPConnection (CNetConfig	*pNetConfig,
@@ -144,12 +149,8 @@ CTCPConnection::CTCPConnection (CNetConfig	*pNetConfig,
 	m_nIRS (0),
 	m_nSND_MSS (536)	// RFC 1122 section 4.2.2.6
 {
-	m_pTxBuffer = new u8[FRAME_BUFFER_SIZE];
-	assert (m_pTxBuffer != 0);
-	
-	m_pTempBuffer = new u8[FRAME_BUFFER_SIZE];
-	assert (m_pTempBuffer != 0);
-	
+	s_nConnections++;
+
 	for (unsigned nTimer = TCPTimerUser; nTimer < TCPTimerUnknown; nTimer++)
 	{
 		m_hTimer[nTimer] = 0;
@@ -191,12 +192,8 @@ CTCPConnection::CTCPConnection (CNetConfig	*pNetConfig,
 	m_nIRS (0),
 	m_nSND_MSS (536)	// RFC 1122 section 4.2.2.6
 {
-	m_pTxBuffer = new u8[FRAME_BUFFER_SIZE];
-	assert (m_pTxBuffer != 0);
-	
-	m_pTempBuffer = new u8[FRAME_BUFFER_SIZE];
-	assert (m_pTempBuffer != 0);
-	
+	s_nConnections++;
+
 	for (unsigned nTimer = TCPTimerUser; nTimer < TCPTimerUnknown; nTimer++)
 	{
 		m_hTimer[nTimer] = 0;
@@ -216,11 +213,12 @@ CTCPConnection::~CTCPConnection (void)
 		StopTimer (nTimer);
 	}
 
-	delete m_pTempBuffer;
-	m_pTempBuffer = 0;
+	// ensure no task is waiting any more
+	m_Event.Set ();
+	m_TxEvent.Set ();
 
-	delete m_pTxBuffer;
-	m_pTxBuffer = 0;
+	assert (s_nConnections > 0);
+	s_nConnections--;
 }
 
 int CTCPConnection::Connect (void)
@@ -260,6 +258,11 @@ int CTCPConnection::Connect (void)
 
 int CTCPConnection::Accept (CIPAddress *pForeignIP, u16 *pForeignPort)
 {
+	if (m_nErrno < 0)
+	{
+		return m_nErrno;
+	}
+
 	switch (m_State)
 	{
 	case TCPStateSynSent:
@@ -291,7 +294,7 @@ int CTCPConnection::Accept (CIPAddress *pForeignIP, u16 *pForeignPort)
 	assert (pForeignPort != 0);
 	*pForeignPort = m_nForeignPort;
 
-	return 0;
+	return m_nErrno;
 }
 
 int CTCPConnection::Close (void)
@@ -396,8 +399,8 @@ int CTCPConnection::Send (const void *pData, unsigned nLength, int nFlags)
 
 	if (!(nFlags & MSG_DONTWAIT))
 	{
-		m_Event.Clear ();
-		m_Event.Wait ();
+		m_TxEvent.Clear ();
+		m_TxEvent.Wait ();
 
 		if (m_nErrno < 0)
 		{
@@ -426,13 +429,11 @@ int CTCPConnection::Receive (void *pBuffer, int nFlags)
 	{
 		switch (m_State)
 		{
-		case TCPStateCloseWait:
-			return 0;
-
 		case TCPStateClosed:
 		case TCPStateListen:
 		case TCPStateFinWait1:
 		case TCPStateFinWait2:
+		case TCPStateCloseWait:
 		case TCPStateClosing:
 		case TCPStateLastAck:
 		case TCPStateTimeWait:
@@ -484,6 +485,17 @@ int CTCPConnection::ReceiveFrom (void *pBuffer, int nFlags, CIPAddress *pForeign
 	}
 
 	return 0;
+}
+
+int CTCPConnection::SetOptionBroadcast (boolean bAllowed)
+{
+	return 0;
+}
+
+boolean CTCPConnection::IsConnected (void) const
+{
+	return     m_State > TCPStateSynSent
+		&& m_State != TCPStateTimeWait;
 }
 
 boolean CTCPConnection::IsTerminated (void) const
@@ -546,16 +558,24 @@ void CTCPConnection::Process (void)
 		break;
 	}
 
-	assert (m_pTempBuffer != 0);
+	u8 TempBuffer[FRAME_BUFFER_SIZE];
 	unsigned nLength;
 	while (    m_RetransmissionQueue.GetFreeSpace () >= FRAME_BUFFER_SIZE
-		&& (nLength = m_TxQueue.Dequeue (m_pTempBuffer)) > 0)
+		&& (nLength = m_TxQueue.Dequeue (TempBuffer)) > 0)
 	{
 #ifdef TCP_DEBUG
 		CLogger::Get ()->Write (FromTCP, LogDebug, "Transfering %u bytes into RT buffer", nLength);
 #endif
 
-		m_RetransmissionQueue.Write (m_pTempBuffer, nLength);
+		m_RetransmissionQueue.Write (TempBuffer, nLength);
+	}
+
+	// pacing transmit
+	if (   (   m_State == TCPStateEstablished
+		|| m_State == TCPStateCloseWait)
+	    && m_TxQueue.IsEmpty ())
+	{
+		m_TxEvent.Set ();
 	}
 
 	if (m_bRetransmit)
@@ -581,7 +601,7 @@ void CTCPConnection::Process (void)
 #endif
 
 		assert (nLength <= FRAME_BUFFER_SIZE);
-		m_RetransmissionQueue.Read (m_pTempBuffer, nLength);
+		m_RetransmissionQueue.Read (TempBuffer, nLength);
 
 		unsigned nFlags = TCP_FLAG_ACK;
 		if (   m_RetransmissionQueue.IsEmpty ()
@@ -590,7 +610,7 @@ void CTCPConnection::Process (void)
 			nFlags |= TCP_FLAG_PUSH;
 		}
 
-		SendSegment (nFlags, m_nSND_NXT, m_nRCV_NXT, m_pTempBuffer, nLength);
+		SendSegment (nFlags, m_nSND_NXT, m_nRCV_NXT, TempBuffer, nLength);
 		m_RTOCalculator.SegmentSent (m_nSND_NXT, nLength);
 		m_nSND_NXT += nLength;
 		StartTimer (TCPTimerRetransmission, m_RTOCalculator.GetRTO ());
@@ -600,6 +620,7 @@ void CTCPConnection::Process (void)
 int CTCPConnection::PacketReceived (const void	*pPacket,
 				    unsigned	 nLength,
 				    CIPAddress	&rSenderIP,
+				    CIPAddress	&rReceiverIP,
 				    int		 nProtocol)
 {
 	if (nProtocol != IPPROTO_TCP)
@@ -727,6 +748,17 @@ int CTCPConnection::PacketReceived (const void	*pPacket,
 		}
 		else if (nFlags & TCP_FLAG_SYN)
 		{
+			if (s_nConnections >= TCP_MAX_CONNECTIONS)
+			{
+				m_ForeignIP.Set (rSenderIP);
+				m_nForeignPort = be2le16 (pHeader->nSourcePort);
+				m_Checksum.SetDestinationAddress (rSenderIP);
+
+				SendSegment (TCP_FLAG_RESET | TCP_FLAG_ACK, 0, nSEG_SEQ+nSEG_LEN);
+
+				break;
+			}
+
 			m_nRCV_NXT = nSEG_SEQ+1;
 			m_nIRS = nSEG_SEQ;
 
@@ -858,6 +890,8 @@ int CTCPConnection::PacketReceived (const void	*pPacket,
 					{
 						SendSegment (TCP_FLAG_RESET, m_nSND_NXT);
 						NEW_STATE (TCPStateClosed);
+						m_nErrno = -1;
+						m_Event.Set ();
 					}
 
 					if (nDataLength > 0)
@@ -1035,8 +1069,6 @@ int CTCPConnection::PacketReceived (const void	*pPacket,
 
 					// next transmission starts with this count
 					m_nRetransmissionCount = MAX_RETRANSMISSIONS;
-
-					m_Event.Set ();
 				}
 
 				if (   m_State == TCPStateFinWait1
@@ -1105,6 +1137,7 @@ int CTCPConnection::PacketReceived (const void	*pPacket,
 					m_bFINQueued = FALSE;
 					StopTimer (TCPTimerRetransmission);
 					NEW_STATE (TCPStateFinWait2);
+					StartTimer (TCPTimerTimeWait, HZ_FIN_TIMEOUT);
 				}
 				else
 				{
@@ -1197,9 +1230,11 @@ int CTCPConnection::PacketReceived (const void	*pPacket,
 			else
 			{
 				SendSegment (TCP_FLAG_ACK, m_nSND_NXT, m_nRCV_NXT);
+				return 1;
 			}
 			break;
 
+		case TCPStateSynReceived:	// this state not in RFC 793
 		case TCPStateCloseWait:
 		case TCPStateClosing:
 		case TCPStateLastAck:
@@ -1277,6 +1312,47 @@ int CTCPConnection::PacketReceived (const void	*pPacket,
 	return 1;
 }
 
+int CTCPConnection::NotificationReceived (TICMPNotificationType  Type,
+					  CIPAddress		&rSenderIP,
+					  CIPAddress		&rReceiverIP,
+					  u16			 nSendPort,
+					  u16			 nReceivePort,
+					  int			 nProtocol)
+{
+	if (nProtocol != IPPROTO_TCP)
+	{
+		return 0;
+	}
+
+	if (m_State < TCPStateSynSent)
+	{
+		return 0;
+	}
+
+	if (   m_ForeignIP != rSenderIP
+	    || m_nForeignPort != nSendPort)
+	{
+		return 0;
+	}
+
+	assert (m_pNetConfig != 0);
+	if (   rReceiverIP != *m_pNetConfig->GetIPAddress ()
+	    || m_nOwnPort != nReceivePort)
+	{
+		return 0;
+	}
+
+	m_nErrno = -1;
+
+	StopTimer (TCPTimerRetransmission);
+	NEW_STATE (TCPStateTimeWait);
+	StartTimer (TCPTimerTimeWait, HZ_TIMEWAIT);
+
+	m_Event.Set ();
+
+	return 1;
+}
+
 boolean CTCPConnection::SendSegment (unsigned nFlags, u32 nSequenceNumber, u32 nAcknowledgmentNumber,
 				     const void *pData, unsigned nDataLength)
 {
@@ -1292,8 +1368,8 @@ boolean CTCPConnection::SendSegment (unsigned nFlags, u32 nSequenceNumber, u32 n
 	assert (nPacketLength >= nHeaderLength);
 	assert (nHeaderLength <= FRAME_BUFFER_SIZE);
 
-	assert (m_pTxBuffer != 0);
-	TTCPHeader *pHeader = (TTCPHeader *) m_pTxBuffer;
+	u8 TxBuffer[FRAME_BUFFER_SIZE];
+	TTCPHeader *pHeader = (TTCPHeader *) TxBuffer;
 
 	pHeader->nSourcePort	 	= le2be16 (m_nOwnPort);
 	pHeader->nDestPort	 	= le2be16 (m_nForeignPort);
@@ -1316,11 +1392,11 @@ boolean CTCPConnection::SendSegment (unsigned nFlags, u32 nSequenceNumber, u32 n
 	if (nDataLength > 0)
 	{
 		assert (pData != 0);
-		memcpy (m_pTxBuffer+nHeaderLength, pData, nDataLength);
+		memcpy (TxBuffer+nHeaderLength, pData, nDataLength);
 	}
 
 	pHeader->nChecksum = 0;		// must be 0 for calculation
-	pHeader->nChecksum = m_Checksum.Calculate (m_pTxBuffer, nPacketLength);
+	pHeader->nChecksum = m_Checksum.Calculate (TxBuffer, nPacketLength);
 
 #ifdef TCP_DEBUG
 	CLogger::Get ()->Write (FromTCP, LogDebug,
@@ -1338,7 +1414,7 @@ boolean CTCPConnection::SendSegment (unsigned nFlags, u32 nSequenceNumber, u32 n
 #endif
 
 	assert (m_pNetworkLayer != 0);
-	return m_pNetworkLayer->Send (m_ForeignIP, m_pTxBuffer, nPacketLength, IPPROTO_TCP);
+	return m_pNetworkLayer->Send (m_ForeignIP, TxBuffer, nPacketLength, IPPROTO_TCP);
 }
 
 void CTCPConnection::ScanOptions (TTCPHeader *pHeader)
@@ -1398,7 +1474,7 @@ void CTCPConnection::StartTimer (unsigned nTimer, unsigned nHZ)
 
 	StopTimer (nTimer);
 
-	m_hTimer[nTimer] = m_pTimer->StartKernelTimer (nHZ, TimerStub, (void *) nTimer, this);
+	m_hTimer[nTimer] = m_pTimer->StartKernelTimer (nHZ, TimerStub, (void *) (uintptr) nTimer, this);
 }
 
 void CTCPConnection::StopTimer (unsigned nTimer)
@@ -1486,12 +1562,12 @@ void CTCPConnection::TimerHandler (unsigned nTimer)
 	}
 }
 
-void CTCPConnection::TimerStub (unsigned hTimer, void *pParam, void *pContext)
+void CTCPConnection::TimerStub (TKernelTimerHandle hTimer, void *pParam, void *pContext)
 {
 	CTCPConnection *pThis = (CTCPConnection *) pContext;
 	assert (pThis != 0);
 
-	unsigned nTimer = (unsigned) pParam;
+	unsigned nTimer = (unsigned) (uintptr) pParam;
 	assert (nTimer < TCPTimerUnknown);
 
 	pThis->TimerHandler (nTimer);

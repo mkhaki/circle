@@ -2,7 +2,7 @@
 // interrupt.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2021  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -21,6 +21,7 @@
 #include <circle/synchronize.h>
 #include <circle/multicore.h>
 #include <circle/bcm2835.h>
+#include <circle/bcm2836.h>
 #include <circle/memio.h>
 #include <circle/sysconfig.h>
 #include <circle/types.h>
@@ -60,25 +61,9 @@ CInterruptSystem::CInterruptSystem (void)
 
 CInterruptSystem::~CInterruptSystem (void)
 {
-	s_pThis = 0;
-}
+	DisableIRQs ();
 
-boolean CInterruptSystem::Initialize (void)
-{
-	TExceptionTable *pTable = (TExceptionTable *) ARM_EXCEPTION_TABLE_BASE;
-	pTable->IRQ = ARM_OPCODE_BRANCH (ARM_DISTANCE (pTable->IRQ, IRQStub));
-
-	CleanDataCache ();
-	DataSyncBarrier ();
-
-	InvalidateInstructionCache ();
-	FlushBranchTargetCache ();
-	DataSyncBarrier ();
-
-	InstructionSyncBarrier ();
-
-#ifndef USE_RPI_STUB_AT
-	DataMemBarrier ();
+	PeripheralEntry ();
 
 	write32 (ARM_IC_FIQ_CONTROL, 0);
 
@@ -86,10 +71,44 @@ boolean CInterruptSystem::Initialize (void)
 	write32 (ARM_IC_DISABLE_IRQS_2, (u32) -1);
 	write32 (ARM_IC_DISABLE_BASIC_IRQS, (u32) -1);
 
-	DataMemBarrier ();
+#if RASPPI >= 2
+	write32 (ARM_LOCAL_TIMER_INT_CONTROL0, 0);
 #endif
 
-	EnableInterrupts ();
+	PeripheralExit ();
+
+	s_pThis = 0;
+}
+
+boolean CInterruptSystem::Initialize (void)
+{
+#if AARCH == 32
+	TExceptionTable *pTable = (TExceptionTable *) ARM_EXCEPTION_TABLE_BASE;
+	pTable->IRQ = ARM_OPCODE_BRANCH (ARM_DISTANCE (pTable->IRQ, IRQStub));
+#ifndef USE_RPI_STUB_AT
+	pTable->FIQ = ARM_OPCODE_BRANCH (ARM_DISTANCE (pTable->FIQ, FIQStub));
+#endif
+
+	SyncDataAndInstructionCache ();
+#endif
+
+#ifndef USE_RPI_STUB_AT
+	PeripheralEntry ();
+
+	write32 (ARM_IC_FIQ_CONTROL, 0);
+
+	write32 (ARM_IC_DISABLE_IRQS_1, (u32) -1);
+	write32 (ARM_IC_DISABLE_IRQS_2, (u32) -1);
+	write32 (ARM_IC_DISABLE_BASIC_IRQS, (u32) -1);
+
+#if RASPPI >= 2
+	write32 (ARM_LOCAL_TIMER_INT_CONTROL0, 0);
+#endif
+
+	PeripheralExit ();
+#endif
+
+	EnableIRQs ();
 
 	return TRUE;
 }
@@ -116,26 +135,97 @@ void CInterruptSystem::DisconnectIRQ (unsigned nIRQ)
 	m_pParam[nIRQ] = 0;
 }
 
+void CInterruptSystem::ConnectFIQ (unsigned nFIQ, TFIQHandler *pHandler, void *pParam)
+{
+#ifdef USE_RPI_STUB_AT
+	assert (0);
+#endif
+	assert (nFIQ <= ARM_MAX_FIQ);
+	assert (pHandler != 0);
+	assert (FIQData.pHandler == 0);
+
+	FIQData.pHandler = pHandler;
+	FIQData.pParam = pParam;
+
+	EnableFIQ (nFIQ);
+}
+
+void CInterruptSystem::DisconnectFIQ (void)
+{
+	assert (FIQData.pHandler != 0);
+
+	DisableFIQ ();
+
+	FIQData.pHandler = 0;
+	FIQData.pParam = 0;
+}
+
 void CInterruptSystem::EnableIRQ (unsigned nIRQ)
 {
-	DataMemBarrier ();
+	PeripheralEntry ();
 
 	assert (nIRQ < IRQ_LINES);
 
-	write32 (ARM_IC_IRQS_ENABLE (nIRQ), ARM_IRQ_MASK (nIRQ));
+	if (nIRQ < ARM_IRQLOCAL_BASE)
+	{
+		write32 (ARM_IC_IRQS_ENABLE (nIRQ), ARM_IRQ_MASK (nIRQ));
+	}
+	else
+	{
+#if RASPPI >= 2
+		assert (nIRQ == ARM_IRQLOCAL0_CNTPNS);	// the only implemented local IRQ so far
+		write32 (ARM_LOCAL_TIMER_INT_CONTROL0,
+			 read32 (ARM_LOCAL_TIMER_INT_CONTROL0) | (1 << 1));
+#else
+		assert (0);
+#endif
+	}
 
-	DataMemBarrier ();
+	PeripheralExit ();
 }
 
 void CInterruptSystem::DisableIRQ (unsigned nIRQ)
 {
-	DataMemBarrier ();
+	PeripheralEntry ();
 
 	assert (nIRQ < IRQ_LINES);
 
-	write32 (ARM_IC_IRQS_DISABLE (nIRQ), ARM_IRQ_MASK (nIRQ));
+	if (nIRQ < ARM_IRQLOCAL_BASE)
+	{
+		write32 (ARM_IC_IRQS_DISABLE (nIRQ), ARM_IRQ_MASK (nIRQ));
+	}
+	else
+	{
+#if RASPPI >= 2
+		assert (nIRQ == ARM_IRQLOCAL0_CNTPNS);	// the only implemented local IRQ so far
+		write32 (ARM_LOCAL_TIMER_INT_CONTROL0,
+			 read32 (ARM_LOCAL_TIMER_INT_CONTROL0) & ~(1 << 1));
+#else
+		assert (0);
+#endif
+	}
 
-	DataMemBarrier ();
+	PeripheralExit ();
+}
+
+void CInterruptSystem::EnableFIQ (unsigned nFIQ)
+{
+	PeripheralEntry ();
+
+	assert (nFIQ <= ARM_MAX_FIQ);
+
+	write32 (ARM_IC_FIQ_CONTROL, nFIQ | 0x80);
+
+	PeripheralExit ();
+}
+
+void CInterruptSystem::DisableFIQ (void)
+{
+	PeripheralEntry ();
+
+	write32 (ARM_IC_FIQ_CONTROL, 0);
+
+	PeripheralExit ();
 }
 
 CInterruptSystem *CInterruptSystem::Get (void)
@@ -167,6 +257,17 @@ void CInterruptSystem::InterruptHandler (void)
 {
 	assert (s_pThis != 0);
 
+#if RASPPI >= 2
+	u32 nLocalPending = read32 (ARM_LOCAL_IRQ_PENDING0);
+	assert (!(nLocalPending & ~(1 << 1 | 0xF << 4 | 1 << 8)));
+	if (nLocalPending & (1 << 1))		// the only implemented local IRQ so far
+	{
+		s_pThis->CallIRQHandler (ARM_IRQLOCAL0_CNTPNS);
+
+		return;
+	}
+#endif
+
 #ifdef ARM_ALLOW_MULTI_CORE
 	if (CMultiCoreSupport::LocalInterruptHandler ())
 	{
@@ -174,10 +275,14 @@ void CInterruptSystem::InterruptHandler (void)
 	}
 #endif
 
+	PeripheralEntry ();
+
 	u32 Pending[ARM_IC_IRQ_REGS];
 	Pending[0] = read32 (ARM_IC_IRQ_PENDING_1);
 	Pending[1] = read32 (ARM_IC_IRQ_PENDING_2);
 	Pending[2] = read32 (ARM_IC_IRQ_BASIC_PENDING) & 0xFF;
+
+	PeripheralExit ();
 
 	for (unsigned nReg = 0; nReg < ARM_IC_IRQ_REGS; nReg++)
 	{
@@ -204,9 +309,9 @@ void CInterruptSystem::InterruptHandler (void)
 
 void InterruptHandler (void)
 {
-	DataMemBarrier ();
+	PeripheralExit ();	// exit from interrupted peripheral
 	
 	CInterruptSystem::InterruptHandler ();
 
-	DataMemBarrier ();
+	PeripheralEntry ();	// continuing with interrupted peripheral
 }

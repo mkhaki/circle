@@ -15,6 +15,7 @@
 #include <circle/timer.h>
 #include <circle/synchronize.h>
 #include <circle/types.h>
+#include <stdint.h>
 
 #endif
 
@@ -53,8 +54,12 @@
 #define ONEWIRE_CRC16 1
 #endif
 
+#ifndef FALSE
 #define FALSE 0
+#endif
+#ifndef TRUE
 #define TRUE  1
+#endif
 
 // Platform specific I/O definitions
 
@@ -113,9 +118,6 @@
 #define DIRECT_WRITE_HIGH(base, mask)   ((*(base+8+2)) = (mask))          //LATXSET + 0x28
 
 #elif defined(__circle__)
-typedef u8  uint8_t;
-typedef u16 uint16_t;
-typedef u32 uint32_t;
 
 #define PROGMEM
 #define pgm_read_byte(addr)             (*(const uint8_t *) (addr))

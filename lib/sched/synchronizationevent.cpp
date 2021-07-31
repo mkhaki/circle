@@ -2,7 +2,7 @@
 // synchronizationevent.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2015  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2015-2021  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -19,17 +19,20 @@
 //
 #include <circle/sched/synchronizationevent.h>
 #include <circle/sched/scheduler.h>
+#include <circle/sched/task.h>
+#include <circle/synchronize.h>
+#include <circle/sysconfig.h>
 #include <assert.h>
 
 CSynchronizationEvent::CSynchronizationEvent (boolean bState)
 :	m_bState (bState),
-	m_pWaitTask (0)
+	m_pWaitListHead (0)
 {
 }
 
 CSynchronizationEvent::~CSynchronizationEvent (void)
 {
-	assert (m_pWaitTask == 0);
+	assert (m_pWaitListHead == 0);
 }
 
 boolean CSynchronizationEvent::GetState (void)
@@ -40,6 +43,10 @@ boolean CSynchronizationEvent::GetState (void)
 void CSynchronizationEvent::Clear (void)
 {
 	m_bState = FALSE;
+
+#ifdef ARM_ALLOW_MULTI_CORE
+	DataSyncBarrier ();
+#endif
 }
 
 void CSynchronizationEvent::Set (void)
@@ -48,20 +55,44 @@ void CSynchronizationEvent::Set (void)
 	{
 		m_bState = TRUE;
 
-		if (m_pWaitTask != 0)
-		{
-			CScheduler::Get ()->WakeTask (&m_pWaitTask);
-		}
+#ifdef ARM_ALLOW_MULTI_CORE
+		DataSyncBarrier ();
+#endif
+
+		CScheduler::Get ()->WakeTasks (&m_pWaitListHead);
 	}
 }
+
+// Wakes all waiting tasks and immediately resets the event again
+void CSynchronizationEvent::Pulse (void)
+{
+	// Cheaper and same effect as Set() + Clear()
+	m_bState = FALSE;
+
+#ifdef ARM_ALLOW_MULTI_CORE
+	DataSyncBarrier ();
+#endif
+
+	CScheduler::Get ()->WakeTasks (&m_pWaitListHead);
+}
+
 
 void CSynchronizationEvent::Wait (void)
 {
 	if (!m_bState)
 	{
-		assert (m_pWaitTask == 0);
-		CScheduler::Get ()->BlockTask (&m_pWaitTask);
+		CScheduler::Get ()->BlockTask (&m_pWaitListHead, 0);
+	}
+}
 
-		assert (m_bState);
+boolean CSynchronizationEvent::WaitWithTimeout (unsigned nMicroSeconds)
+{
+	if (m_bState)
+	{
+		return nMicroSeconds == 0;
+	}
+	else
+	{
+		return CScheduler::Get ()->BlockTask (&m_pWaitListHead, nMicroSeconds);
 	}
 }

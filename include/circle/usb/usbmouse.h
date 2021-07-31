@@ -2,7 +2,7 @@
 // usbmouse.h
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2018  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -21,16 +21,31 @@
 #define _circle_usb_usbmouse_h
 
 #include <circle/usb/usbhiddevice.h>
+#include <circle/input/mouse.h>
 #include <circle/types.h>
 
-#define MOUSE_DISPLACEMENT_MIN	-127
-#define MOUSE_DISPLACEMENT_MAX	127
+enum TMouseReportType
+{
+	MouseItemButtons,
+	MouseItemXAxis,
+	MouseItemYAxis,
+	MouseItemWheel,
 
-#define MOUSE_BUTTON_LEFT	(1 << 0)
-#define MOUSE_BUTTON_RIGHT	(1 << 1)
-#define MOUSE_BUTTON_MIDDLE	(1 << 2)
+	MouseItemCount
+};
 
-typedef void TMouseStatusHandler (unsigned nButtons, int nDisplacementX, int nDisplacementY);
+struct TMouseReportItem
+{
+	unsigned bitSize;
+	unsigned bitOffset;
+};
+
+struct TMouseReport
+{
+	unsigned id;
+	unsigned byteSize;
+	TMouseReportItem items[MouseItemCount];
+};
 
 class CUSBMouseDevice : public CUSBHIDDevice
 {
@@ -40,15 +55,19 @@ public:
 
 	boolean Configure (void);
 
-	void RegisterStatusHandler (TMouseStatusHandler *pStatusHandler);
+private:
+	void ReportHandler (const u8 *pReport, unsigned nReportSize);
+	void DecodeReport (void);
+	u32 ExtractUnsigned (const void *buffer, u32 offset, u32 length);
+	s32 ExtractSigned (const void *buffer, u32 offset, u32 length);
 
 private:
-	void ReportHandler (const u8 *pReport);
+	CMouseDevice *m_pMouseDevice;
 
-private:
-	TMouseStatusHandler *m_pStatusHandler;
+	u8 *m_pHIDReportDescriptor;
+	u16 m_usReportDescriptorLength;
 
-	static unsigned s_nDeviceNumber;
+	TMouseReport m_MouseReport;
 };
 
 #endif

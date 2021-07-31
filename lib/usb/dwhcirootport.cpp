@@ -2,7 +2,7 @@
 // dwhcirootport.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2020  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -52,7 +52,7 @@ boolean CDWHCIRootPort::Initialize (void)
 	
 	// first create default device
 	assert (m_pDevice == 0);
-	m_pDevice = new CUSBDevice (m_pHost, Speed, FALSE, 0, 1);
+	m_pDevice = new CUSBDevice (m_pHost, Speed, this);
 	assert (m_pDevice != 0);
 
 	if (!m_pDevice->Initialize ())
@@ -89,4 +89,48 @@ boolean CDWHCIRootPort::Initialize (void)
 	}
 
 	return TRUE;
+}
+
+boolean CDWHCIRootPort::ReScanDevices (void)
+{
+	if (m_pDevice == 0)
+	{
+		CLogger::Get ()->Write (FromDWHCIRoot, LogWarning,
+					"Previous attempt to initialize device failed");
+
+		return FALSE;
+	}
+
+	return m_pDevice->ReScanDevices ();
+}
+
+boolean CDWHCIRootPort::RemoveDevice (void)
+{
+	assert (m_pHost != 0);
+	m_pHost->DisableRootPort (FALSE);
+
+	delete m_pDevice;
+	m_pDevice = 0;
+
+	return TRUE;
+}
+
+void CDWHCIRootPort::HandlePortStatusChange (void)
+{
+	assert (m_pHost != 0);
+
+	if (m_pHost->DeviceConnected ())
+	{
+		if (m_pDevice == 0)
+		{
+			m_pHost->ReScanDevices ();
+		}
+	}
+	else
+	{
+		if (m_pDevice != 0)
+		{
+			RemoveDevice ();
+		}
+	}
 }

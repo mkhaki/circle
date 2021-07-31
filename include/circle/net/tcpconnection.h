@@ -2,7 +2,7 @@
 // tcpconnection.h
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2015-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2015-2020  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -23,6 +23,7 @@
 #include <circle/net/netconnection.h>
 #include <circle/net/networklayer.h>
 #include <circle/net/ipaddress.h>
+#include <circle/net/icmphandler.h>
 #include <circle/net/netqueue.h>
 #include <circle/net/retransmissionqueue.h>
 #include <circle/net/retranstimeoutcalc.h>
@@ -79,12 +80,22 @@ public:
 	int SendTo (const void *pData, unsigned nLength, int nFlags, CIPAddress	&rForeignIP, u16 nForeignPort);
 	int ReceiveFrom (void *pBuffer, int nFlags, CIPAddress *pForeignIP, u16 *pForeignPort);
 
+	int SetOptionBroadcast (boolean bAllowed);
+
+	boolean IsConnected (void) const;
 	boolean IsTerminated (void) const;
 	
 	void Process (void);
 	
 	// returns: -1: invalid packet, 0: not to me, 1: packet consumed
-	int PacketReceived (const void *pPacket, unsigned nLength, CIPAddress &rSenderIP, int nProtocol);
+	int PacketReceived (const void *pPacket, unsigned nLength,
+			    CIPAddress &rSenderIP, CIPAddress &rReceiverIP, int nProtocol);
+
+	// returns: 0: not to me, 1: notification consumed
+	int NotificationReceived (TICMPNotificationType Type,
+				  CIPAddress &rSenderIP, CIPAddress &rReceiverIP,
+				  u16 nSendPort, u16 nReceivePort,
+				  int nProtocol);
 
 private:
 	boolean SendSegment (unsigned nFlags, u32 nSequenceNumber, u32 nAcknowledgmentNumber = 0,
@@ -97,7 +108,7 @@ private:
 	void StartTimer (unsigned nTimer, unsigned nHZ);
 	void StopTimer (unsigned nTimer);
 	void TimerHandler (unsigned nTimer);
-	static void TimerStub (unsigned hTimer, void *pParam, void *pContext);
+	static void TimerStub (TKernelTimerHandle hTimer, void *pParam, void *pContext);
 
 #ifndef NDEBUG
 	void DumpStatus (void);
@@ -123,13 +134,11 @@ private:
 	volatile unsigned m_nRetransmissionCount;
 	volatile boolean m_bTimedOut;		// abort connection and close
 	
-	u8 *m_pTxBuffer;
-	u8 *m_pTempBuffer;
-
 	CSynchronizationEvent m_Event;
+	CSynchronizationEvent m_TxEvent;	// for pacing transmit
 
 	CTimer *m_pTimer;
-	unsigned m_hTimer[TCPTimerUnknown];
+	TKernelTimerHandle m_hTimer[TCPTimerUnknown];
 	CSpinLock m_TimerSpinLock;
 
 	// Send Sequence Variables
@@ -151,6 +160,8 @@ private:
 	u16 m_nSND_MSS;		// send maximum segment size
 
 	CRetransmissionTimeoutCalculator m_RTOCalculator;
+
+	static unsigned s_nConnections;
 };
 
 #endif

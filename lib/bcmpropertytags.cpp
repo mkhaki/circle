@@ -2,7 +2,7 @@
 // bcmpropertytags.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2019  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -21,7 +21,8 @@
 #include <circle/util.h>
 #include <circle/synchronize.h>
 #include <circle/bcm2835.h>
-#include <circle/sysconfig.h>
+#include <circle/memory.h>
+#include <circle/macros.h>
 #include <assert.h>
 
 struct TPropertyBuffer
@@ -33,10 +34,11 @@ struct TPropertyBuffer
 	#define CODE_RESPONSE_FAILURE	0x80000001
 	u8	Tags[0];
 	// end tag follows
-};
+}
+PACKED;
 
-CBcmPropertyTags::CBcmPropertyTags (void)
-:	m_MailBox (BCM_MAILBOX_PROP_OUT)
+CBcmPropertyTags::CBcmPropertyTags (boolean bEarlyUse)
+:	m_MailBox (BCM_MAILBOX_PROP_OUT, bEarlyUse)
 {
 }
 
@@ -48,84 +50,59 @@ boolean CBcmPropertyTags::GetTag (u32 nTagId, void *pTag, unsigned nTagSize, uns
 {
 	assert (pTag != 0);
 	assert (nTagSize >= sizeof (TPropertyTagSimple));
-	unsigned nBufferSize = sizeof (TPropertyBuffer) + nTagSize + sizeof (u32);
-	assert ((nBufferSize & 3) == 0);
 
-#if RASPPI != 3
-	// cannot use "new" here because this is used before mem_init() is called
-	u8 Buffer[nBufferSize + 15];
-	TPropertyBuffer *pBuffer = (TPropertyBuffer *) (((u32) Buffer + 15) & ~15);
-#else
-#ifndef USE_RPI_STUB_AT
-	TPropertyBuffer *pBuffer = (TPropertyBuffer *) MEM_COHERENT_REGION;
-#else
-	TPropertyBuffer *pBuffer;
-	u32 nSize;
-
-	asm volatile
-	(
-		"push {r0-r1}\n"
-		"mov r0, #1\n"
-		"bkpt #0x7FFA\n"	// get coherent region from rpi_stub
-		"mov %0, r0\n"
-		"mov %1, r1\n"
-		"pop {r0-r1}\n"
-
-		: "=r" (pBuffer), "=r" (nSize)
-	);
-
-	assert (pBuffer != 0);
-	assert (nSize >= nBufferSize);
-#endif
-#endif
-	
-	pBuffer->nBufferSize = nBufferSize;
-	pBuffer->nCode = CODE_REQUEST;
-	memcpy (pBuffer->Tags, pTag, nTagSize);
-	
-	TPropertyTag *pHeader = (TPropertyTag *) pBuffer->Tags;
+	TPropertyTag *pHeader = (TPropertyTag *) pTag;
 	pHeader->nTagId = nTagId;
 	pHeader->nValueBufSize = nTagSize - sizeof (TPropertyTag);
 	pHeader->nValueLength = nRequestParmSize & ~VALUE_LENGTH_RESPONSE;
 
-	u32 *pEndTag = (u32 *) (pBuffer->Tags + nTagSize);
-	*pEndTag = PROPTAG_END;
-
-#if RASPPI != 3
-	CleanDataCache ();
-	DataSyncBarrier ();
-#endif
-
-	u32 nBufferAddress = GPU_MEM_BASE + (u32) pBuffer;
-	if (m_MailBox.WriteRead (nBufferAddress) != nBufferAddress)
+	if (!GetTags (pTag, nTagSize))
 	{
 		return FALSE;
 	}
-	
-#if RASPPI != 3
-	InvalidateDataCache ();
-	DataSyncBarrier ();
-#else
-	DataMemBarrier ();
-#endif
 
-	if (pBuffer->nCode != CODE_RESPONSE_SUCCESS)
-	{
-		return FALSE;
-	}
-	
-	if (!(pHeader->nValueLength & VALUE_LENGTH_RESPONSE))
-	{
-		return FALSE;
-	}
-	
 	pHeader->nValueLength &= ~VALUE_LENGTH_RESPONSE;
 	if (pHeader->nValueLength == 0)
 	{
 		return FALSE;
 	}
 
-	memcpy (pTag, pBuffer->Tags, nTagSize);
+	return TRUE;
+}
+
+boolean CBcmPropertyTags::GetTags (void *pTags, unsigned nTagsSize)
+{
+	assert (pTags != 0);
+	assert (nTagsSize >= sizeof (TPropertyTagSimple));
+	unsigned nBufferSize = sizeof (TPropertyBuffer) + nTagsSize + sizeof (u32);
+	assert ((nBufferSize & 3) == 0);
+
+	TPropertyBuffer *pBuffer =
+		(TPropertyBuffer *) CMemorySystem::GetCoherentPage (COHERENT_SLOT_PROP_MAILBOX);
+
+	pBuffer->nBufferSize = nBufferSize;
+	pBuffer->nCode = CODE_REQUEST;
+	memcpy (pBuffer->Tags, pTags, nTagsSize);
+
+	u32 *pEndTag = (u32 *) (pBuffer->Tags + nTagsSize);
+	*pEndTag = PROPTAG_END;
+
+	DataSyncBarrier ();
+
+	u32 nBufferAddress = BUS_ADDRESS ((uintptr) pBuffer);
+	if (m_MailBox.WriteRead (nBufferAddress) != nBufferAddress)
+	{
+		return FALSE;
+	}
+
+	DataMemBarrier ();
+
+	if (pBuffer->nCode != CODE_RESPONSE_SUCCESS)
+	{
+		return FALSE;
+	}
+
+	memcpy (pTags, pBuffer->Tags, nTagsSize);
 
 	return TRUE;
 }

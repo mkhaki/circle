@@ -2,7 +2,7 @@
 // usbbluetooth.h
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2015  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2015-2020  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -23,9 +23,10 @@
 #include <circle/usb/usbfunction.h>
 #include <circle/usb/usbendpoint.h>
 #include <circle/usb/usbrequest.h>
+#include <circle/numberpool.h>
 #include <circle/types.h>
 
-typedef void TUSBBluetoothHCIEventHandler (const void *pBuffer, unsigned nLength);
+typedef void TBTHCIEventHandler (const void *pBuffer, unsigned nLength);
 
 class CUSBBluetoothDevice : public CUSBFunction
 {
@@ -37,7 +38,7 @@ public:
 
 	boolean SendHCICommand (const void *pBuffer, unsigned nLength);
 
-	void RegisterHCIEventHandler (TUSBBluetoothHCIEventHandler *pHandler);
+	void RegisterHCIEventHandler (TBTHCIEventHandler *pHandler);
 
 private:
 	boolean StartRequest (void);
@@ -50,12 +51,12 @@ private:
 	CUSBEndpoint *m_pEndpointBulkIn;
 	CUSBEndpoint *m_pEndpointBulkOut;
 
-	CUSBRequest *m_pURB;
 	u8 *m_pEventBuffer;
 
-	TUSBBluetoothHCIEventHandler *m_pEventHandler;
+	TBTHCIEventHandler *m_pEventHandler;
 
-	static unsigned s_nDeviceNumber;
+	unsigned m_nDeviceNumber;
+	static CNumberPool s_DeviceNumberPool;
 };
 
 #endif

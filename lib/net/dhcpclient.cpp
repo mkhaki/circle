@@ -4,7 +4,7 @@
 // This implements a DHCP client (RFC 2131 and RFC 2132).
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2015  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2015-2020  R. Stange <rsta2@o2online.de>
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -21,7 +21,7 @@
 //
 #include <circle/net/dhcpclient.h>
 #include <circle/net/in.h>
-#include <circle/usb/macaddress.h>
+#include <circle/macaddress.h>
 #include <circle/sched/scheduler.h>
 #include <circle/logger.h>
 #include <circle/timer.h>
@@ -73,6 +73,7 @@ struct TDHCPOption
 #define DHCP_OPTION_SUBNETMASK	1
 #define DHCP_OPTION_ROUTER	3
 #define DHCP_OPTION_DNSSERVER	6
+#define DHCP_OPTION_HOSTNAME	12
 #define DHCP_OPTION_REQIPADDR	50
 #define DHCP_OPTION_LEASETIME	51
 	#define DHCP_OPTION_LEASETIME_INFINITE	((u32) -1)
@@ -104,14 +105,17 @@ static const char FromDHCPClient[] = "dhcp";
 #define MAX_TRIES	4
 const unsigned CDHCPClient::s_TimeoutHZ[MAX_TRIES] = {4*HZ, 8*HZ, 16*HZ, 32*HZ};
 
-CDHCPClient::CDHCPClient (CNetSubSystem *pNetSubSystem)
+CDHCPClient::CDHCPClient (CNetSubSystem *pNetSubSystem, const char *pHostname)
 :	m_pNetSubSystem (pNetSubSystem),
 	m_pNetConfig (pNetSubSystem->GetConfig ()),
+	m_Hostname (pHostname != 0 ? pHostname : ""),
 	m_Socket (pNetSubSystem, IPPROTO_UDP),
 	m_bIsBound (FALSE)
 {
 	assert (m_pNetSubSystem != 0);
 	assert (m_pNetConfig != 0);
+
+	assert (m_Hostname.GetLength () <= 30);
 }
 
 CDHCPClient::~CDHCPClient (void)
@@ -226,6 +230,13 @@ TDHCPStatus CDHCPClient::SelectAndRequest (void)
 		return DHCPStatusConnectError;
 	}
 
+	if (m_Socket.SetOptionBroadcast (TRUE))
+	{
+		CLogger::Get ()->Write (FromDHCPClient, LogError, "Cannot set broadcast option");
+
+		return DHCPStatusConnectError;
+	}
+
 	m_nXID = GetXID ();		// new transaction ID
 
 	// SELECTING state
@@ -329,6 +340,13 @@ TDHCPStatus CDHCPClient::RenewOrRebind (boolean bRenew, unsigned nTimeout)
 		return DHCPStatusConnectError;
 	}
 
+	if (m_Socket.SetOptionBroadcast (m_bUseBroadcast))
+	{
+		CLogger::Get ()->Write (FromDHCPClient, LogError, "Cannot set broadcast option");
+
+		return DHCPStatusConnectError;
+	}
+
 	boolean bReceiveOK = FALSE;
 	while (CTimer::Get ()->GetUptime () - m_nBoundSince < nTimeout)
 	{
@@ -419,7 +437,7 @@ boolean CDHCPClient::SendAndReceive (boolean bRequest, u32 nCIAddr)
 	{
 		if (!(bRequest ? SendRequest (nCIAddr) : SendDiscover ()))
 		{
-			CLogger::Get ()->Write (FromDHCPClient, LogError, "Cannot send %",
+			CLogger::Get ()->Write (FromDHCPClient, LogError, "Cannot send %s",
 						bRequest ? "REQUEST" : "DISCOVER");
 
 			return FALSE;
@@ -486,6 +504,9 @@ boolean CDHCPClient::SendRequest (u32 nCIAddr)
 {
 	m_nTxCIAddr = nCIAddr;
 
+	const u8 *pOptions;
+	unsigned nOptionsSize;
+
 	if (nCIAddr == 0)
 	{
 		static u8 Options[] =
@@ -508,7 +529,8 @@ boolean CDHCPClient::SendRequest (u32 nCIAddr)
 		SetUnaligned (Options+REQ_OFFSET_SERVERID,  m_nServerIdentifier);
 		SetUnaligned (Options+REQ_OFFSET_REQIPADDR, m_nOwnIPAddress);
 
-		return SendMessage (Options, sizeof Options);
+		pOptions = Options;
+		nOptionsSize = sizeof Options;
 	}
 	else
 	{
@@ -525,8 +547,33 @@ boolean CDHCPClient::SendRequest (u32 nCIAddr)
 			DHCP_OPTION_END
 		};
 
-		return SendMessage (Options, sizeof Options);
+		pOptions = Options;
+		nOptionsSize = sizeof Options;
 	}
+
+	unsigned nHostnameLen = m_Hostname.GetLength ();
+	if (nHostnameLen == 0)
+	{
+		return SendMessage (pOptions, nOptionsSize);
+	}
+
+	// insert host name option
+	assert (nHostnameLen <= 255);
+	unsigned nOptionsBufferSize = nOptionsSize + nHostnameLen+2;
+	u8 OptionsBuffer[nOptionsBufferSize];
+	u8 *p = OptionsBuffer;
+
+	memcpy (p, pOptions, nOptionsSize);
+	p += nOptionsSize-1;			// ignore end option
+
+	*p++ = DHCP_OPTION_HOSTNAME;
+	*p++ = (u8) nHostnameLen;
+	memcpy (p, (const char *) m_Hostname, nHostnameLen);
+	p += nHostnameLen;
+
+	*p = DHCP_OPTION_END;
+
+	return SendMessage (OptionsBuffer, nOptionsBufferSize);
 }
 
 boolean CDHCPClient::SendMessage (const u8 *pOptions, unsigned nOptionsSize)

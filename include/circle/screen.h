@@ -2,7 +2,7 @@
 // screen.h
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2021  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -23,20 +23,25 @@
 #include <circle/device.h>
 #include <circle/bcmframebuffer.h>
 #include <circle/chargenerator.h>
+#include <circle/dmachannel.h>
 #include <circle/spinlock.h>
+#include <circle/sysconfig.h>
 #include <circle/macros.h>
 #include <circle/types.h>
 
-#define DEPTH	8		// can be: 8, 16 or 32
+#ifndef DEPTH
+#define DEPTH	16		// can be: 8, 16 or 32
+#endif
 
 // really ((green) & 0x3F) << 5, but to have a 0-31 range for all colors
 #define COLOR16(red, green, blue)	  (((red) & 0x1F) << 11 \
 					| ((green) & 0x1F) << 6 \
 					| ((blue) & 0x1F))
 
-#define COLOR32(red, green, blue, alpha)  (((red) & 0xFF)        \
+// BGRA (was RGBA with older firmware)
+#define COLOR32(red, green, blue, alpha)  (((blue) & 0xFF)       \
 					| ((green) & 0xFF) << 8  \
-					| ((blue) & 0xFF) << 16  \
+					| ((red) & 0xFF)   << 16 \
 					| ((alpha) & 0xFF) << 24)
 
 #define BLACK_COLOR	0
@@ -78,40 +83,75 @@ struct TScreenStatus
 	unsigned	nCursorY;
 	boolean		bCursorOn;
 	TScreenColor	Color;
+	TScreenColor	BackgroundColor;
+	boolean		ReverseAttribute;
 	boolean		bInsertOn;
 	unsigned	nParam1;
 	unsigned	nParam2;
 	boolean		bUpdated;
 };
 
-class CScreenDevice : public CDevice
+class CScreenDevice : public CDevice	/// Writing characters to screen
 {
 public:
-	CScreenDevice (unsigned nWidth, unsigned nHeight, boolean bVirtual = FALSE);
+	/// \param nWidth   Screen width in pixels (0 for default resolution)
+	/// \param nHeight  Screen height in pixels (0 for default resolution)
+	/// \param bVirtual FALSE for physical screen, TRUE for virtual screen buffer
+	/// \param nDisplay Zero-based display number (for Raspberry Pi 4)
+	CScreenDevice (unsigned nWidth, unsigned nHeight, boolean bVirtual = FALSE,
+		       unsigned nDisplay = 0);
+
 	~CScreenDevice (void);
 
+	/// \return Operation successful?
 	boolean Initialize (void);
 
-	// size in pixels
+	/// \return Screen width in pixels
 	unsigned GetWidth (void) const;
+	/// \return Screen height in pixels
 	unsigned GetHeight (void) const;
 
-	// size in characters
+	/// \return Screen width in characters
 	unsigned GetColumns (void) const;
+	/// \return Screen height in characters
 	unsigned GetRows (void) const;
 
+#ifndef SCREEN_HEADLESS
+	/// \return Pointer to frame buffer object
+	CBcmFrameBuffer *GetFrameBuffer (void);
+
+	/// \return Current screen status to be written back with SetStatus()
 	TScreenStatus GetStatus (void);
-	boolean SetStatus (TScreenStatus Status);	// returns FALSE on failure
+	/// \param Status Screen status previously returned from GetStatus()
+	/// \return FALSE on failure (screen is currently updated and cannot be written)
+	boolean SetStatus (const TScreenStatus &Status);
+#endif
 
-	int Write (const void *pBuffer, unsigned nCount);
+	/// \brief Write characters to screen
+	/// \note Supports several escape sequences (see: doc/screen.txt).
+	/// \param pBuffer Pointer to the characters to be written
+	/// \param nCount  Number of characters to be written
+	/// \return Number of written characters
+	int Write (const void *pBuffer, size_t nCount);
 
+	/// \brief Set a pixel to a specific color
+	/// \param nPosX X-Position of the pixel (based on 0)
+	/// \param nPosY Y-Position of the pixel (based on 0)
+	/// \param Color The color to be set (value depends on screen DEPTH)
 	void SetPixel (unsigned nPosX, unsigned nPosY, TScreenColor Color);
+	/// \brief Get the color value of a pixel
+	/// \param nPosX X-Position of the pixel (based on 0)
+	/// \param nPosY Y-Position of the pixel (based on 0)
+	/// \return The requested color value (depends on screen DEPTH)
 	TScreenColor GetPixel (unsigned nPosX, unsigned nPosY);
 
-	void Rotor (unsigned nIndex,		// 0..3
-		    unsigned nCount);		// 0..3
+	/// \brief Displays rotating symbols in the upper right corner of the screen
+	/// \param nIndex Index of the rotor to be displayed (0..3)
+	/// \param nCount Phase (angle) of the current rotor symbol (0..3)
+	void Rotor (unsigned nIndex, unsigned nCount);
 
 private:
+#ifndef SCREEN_HEADLESS
 	void Write (char chChar);
 
 	void CarriageReturn (void);
@@ -127,6 +167,8 @@ private:
 	void DeleteLines (unsigned nCount);
 	void DisplayChar (char chChar);
 	void EraseChars (unsigned nCount);
+	TScreenColor GetTextBackgroundColor (void);
+	TScreenColor GetTextColor (void);
 	void InsertLines (unsigned nCount);
 	void InsertMode (boolean bBegin);
 	void NewLine (void);
@@ -141,19 +183,26 @@ private:
 	void DisplayChar (char chChar, unsigned nPosX, unsigned nPosY, TScreenColor Color);
 	void EraseChar (unsigned nPosX, unsigned nPosY);
 	void InvertCursor (void);
+#endif
 
 private:
 	unsigned	 m_nInitWidth;
 	unsigned	 m_nInitHeight;
+#ifndef SCREEN_HEADLESS
 	boolean		 m_bVirtual;
+	unsigned	 m_nDisplay;
 	CBcmFrameBuffer	*m_pFrameBuffer;
+#endif
 	CCharGenerator	 m_CharGen;
+#ifndef SCREEN_HEADLESS
 	TScreenColor  	*m_pBuffer;
 	unsigned	 m_nSize;
 	unsigned	 m_nPitch;
+#endif
 	unsigned	 m_nWidth;
 	unsigned	 m_nHeight;
 	unsigned	 m_nUsedHeight;
+#ifndef SCREEN_HEADLESS
 	unsigned	 m_nState;
 	unsigned	 m_nScrollStart;
 	unsigned	 m_nScrollEnd;
@@ -161,11 +210,17 @@ private:
 	unsigned	 m_nCursorY;
 	boolean		 m_bCursorOn;
 	TScreenColor	 m_Color;
+	TScreenColor	 m_BackgroundColor;
+	boolean		 m_ReverseAttribute;
 	boolean		 m_bInsertOn;
 	unsigned	 m_nParam1;
 	unsigned	 m_nParam2;
 	boolean		 m_bUpdated;
+#ifdef SCREEN_DMA_BURST_LENGTH
+	CDMAChannel	 m_DMAChannel;
+#endif
 	CSpinLock	 m_SpinLock;
+#endif
 };
 
 #endif

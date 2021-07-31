@@ -2,7 +2,7 @@
 // spinlock.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2015  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2015-2020  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -24,36 +24,32 @@
 #include <circle/multicore.h>
 #include <assert.h>
 
-//#define SPINLOCK_SAVE_POWER
+#define SPINLOCK_SAVE_POWER
 
 boolean CSpinLock::s_bEnabled = FALSE;
 
-CSpinLock::CSpinLock (boolean bDisableIRQ)
-:	m_bDisableIRQ (bDisableIRQ),
-	m_bLocked (FALSE)
+CSpinLock::CSpinLock (unsigned nTargetLevel)
+:	m_nTargetLevel (nTargetLevel),
+	m_nLocked (0)
 {
+	assert (nTargetLevel <= FIQ_LEVEL);
 }
 
 CSpinLock::~CSpinLock (void)
 {
-	assert (!m_bLocked);
+	assert (m_nLocked == 0);
 }
 
 void CSpinLock::Acquire (void)
 {
-	if (m_bDisableIRQ)
+	if (m_nTargetLevel >= IRQ_LEVEL)
 	{
-		asm volatile
-		(
-			"mrs %0, cpsr\n"
-			"cpsid i\n"
-
-			: "=r" (m_nCPSR[CMultiCoreSupport::ThisCore ()])
-		);
+		EnterCritical (m_nTargetLevel);
 	}
 
 	if (s_bEnabled)
 	{
+#if AARCH == 32
 		// See: ARMv7-A Architecture Reference Manual, Section D7.3
 		asm volatile
 		(
@@ -69,8 +65,23 @@ void CSpinLock::Acquire (void)
 			"bne 1b\n"
 			"dmb\n"
 
-			: : "r" ((u32) &m_bLocked)
+			: : "r" ((uintptr) &m_nLocked) : "r1", "r2", "r3"
 		);
+#else
+		// See: ARMv8-A Architecture Reference Manual, Section K10.3.1
+		asm volatile
+		(
+			"mov x1, %0\n"
+			"mov w2, #1\n"
+			"prfm pstl1keep, [x1]\n"
+			"1: ldaxr w3, [x1]\n"
+			"cbnz w3, 1b\n"
+			"stxr w3, w2, [x1]\n"
+			"cbnz w3, 1b\n"
+
+			: : "r" ((uintptr) &m_nLocked) : "x1", "x2", "x3"
+		);
+#endif
 	}
 }
 
@@ -78,6 +89,7 @@ void CSpinLock::Release (void)
 {
 	if (s_bEnabled)
 	{
+#if AARCH == 32
 		// See: ARMv7-A Architecture Reference Manual, Section D7.3
 		asm volatile
 		(
@@ -90,22 +102,24 @@ void CSpinLock::Release (void)
 			"sev\n"
 #endif
 
-			: : "r" ((u32) &m_bLocked)
+			: : "r" ((uintptr) &m_nLocked) : "r1", "r2"
 		);
-	}
-
-	if (m_bDisableIRQ)
-	{
+#else
+		// See: ARMv8-A Architecture Reference Manual, Section K10.3.2
 		asm volatile
 		(
-			"tst %0, #0x80\n"	// test IRQ disable bit
-			"bne 1f\n"
-			"cpsie i\n"
-			"1:\n"
+			"mov x1, %0\n"
+			"stlr wzr, [x1]\n"
 
-			: : "r" (m_nCPSR[CMultiCoreSupport::ThisCore ()])
+			: : "r" ((uintptr) &m_nLocked) : "x1"
 		);
-	};
+#endif
+	}
+
+	if (m_nTargetLevel >= IRQ_LEVEL)
+	{
+		LeaveCritical ();
+	}
 }
 
 void CSpinLock::Enable (void)

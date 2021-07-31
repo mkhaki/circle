@@ -9,7 +9,7 @@
 // See the file lib/usb/README for details!
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2020  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -26,11 +26,12 @@
 //
 #include <circle/usb/smsc951x.h>
 #include <circle/usb/usbhostcontroller.h>
-#include <circle/devicenameservice.h>
 #include <circle/bcmpropertytags.h>
-#include <circle/timer.h>
+#include <circle/synchronize.h>
 #include <circle/logger.h>
+#include <circle/timer.h>
 #include <circle/util.h>
+#include <circle/macros.h>
 #include <circle/debug.h>
 #include <assert.h>
 
@@ -125,23 +126,15 @@
 
 static const char FromSMSC951x[] = "smsc951x";
 
-unsigned CSMSC951xDevice::s_nDeviceNumber = 0;
-
 CSMSC951xDevice::CSMSC951xDevice (CUSBFunction *pFunction)
-:	CNetDevice (pFunction),
+:	CUSBFunction (pFunction),
 	m_pEndpointBulkIn (0),
-	m_pEndpointBulkOut (0),
-	m_pTxBuffer (0)
+	m_pEndpointBulkOut (0)
 {
-	m_pTxBuffer = new u8[FRAME_BUFFER_SIZE];
-	assert (m_pTxBuffer != 0);
 }
 
 CSMSC951xDevice::~CSMSC951xDevice (void)
 {
-	delete m_pTxBuffer;
-	m_pTxBuffer = 0;
-
 	delete m_pEndpointBulkOut;
 	m_pEndpointBulkOut = 0;
 
@@ -221,8 +214,12 @@ boolean CSMSC951xDevice::Configure (void)
 
 	u8 MACAddressBuffer[MAC_ADDRESS_SIZE];
 	m_MACAddress.CopyTo (MACAddressBuffer);
-	u16 usMACAddressHigh = *(u16 *) &MACAddressBuffer[4];
-	u32 nMACAddressLow   = *(u32 *) &MACAddressBuffer[0];
+	u16 usMACAddressHigh =   (u16) MACAddressBuffer[4]
+			       | (u16) MACAddressBuffer[5] << 8;
+	u32 nMACAddressLow   =   (u32) MACAddressBuffer[0]
+			       | (u32) MACAddressBuffer[1] << 8
+			       | (u32) MACAddressBuffer[2] << 16
+			       | (u32) MACAddressBuffer[3] << 24;
 	if (   !WriteReg (ADDRH, usMACAddressHigh)
 	    || !WriteReg (ADDRL, nMACAddressLow))
 	{
@@ -245,11 +242,7 @@ boolean CSMSC951xDevice::Configure (void)
 		return FALSE;
 	}
 
-	// TODO: check if PHY is up (wait for it)
-
-	CString DeviceName;
-	DeviceName.Format ("eth%u", s_nDeviceNumber++);
-	CDeviceNameService::Get ()->AddDevice (DeviceName, this, FALSE);
+	AddNetDevice ();
 
 	return TRUE;
 }
@@ -261,20 +254,21 @@ const CMACAddress *CSMSC951xDevice::GetMACAddress (void) const
 
 boolean CSMSC951xDevice::SendFrame (const void *pBuffer, unsigned nLength)
 {
-	if (nLength >= FRAME_BUFFER_SIZE-8)
+	if (nLength > FRAME_BUFFER_SIZE)
 	{
 		return FALSE;
 	}
 
-	assert (m_pTxBuffer != 0);
+	DMA_BUFFER (u8, TxBuffer, FRAME_BUFFER_SIZE+8);
 	assert (pBuffer != 0);
-	memcpy (m_pTxBuffer+8, pBuffer, nLength);
-	
-	*(u32 *) &m_pTxBuffer[0] = TX_CMD_A_FIRST_SEG | TX_CMD_A_LAST_SEG | nLength;
-	*(u32 *) &m_pTxBuffer[4] = nLength;
+	memcpy (TxBuffer+8, pBuffer, nLength);
+
+	u32 *pTxHeader = (u32 *) TxBuffer;
+	pTxHeader[0] = TX_CMD_A_FIRST_SEG | TX_CMD_A_LAST_SEG | nLength;
+	pTxHeader[1] = nLength;
 	
 	assert (m_pEndpointBulkOut != 0);
-	return GetHost ()->Transfer (m_pEndpointBulkOut, m_pTxBuffer, nLength+8) >= 0;
+	return GetHost ()->Transfer (m_pEndpointBulkOut, TxBuffer, nLength+8) >= 0;
 }
 
 boolean CSMSC951xDevice::ReceiveFrame (void *pBuffer, unsigned *pResultLength)
@@ -318,6 +312,109 @@ boolean CSMSC951xDevice::ReceiveFrame (void *pBuffer, unsigned *pResultLength)
 	assert (pResultLength != 0);
 	*pResultLength = nFrameLength;
 	
+	return TRUE;
+}
+
+boolean CSMSC951xDevice::IsLinkUp (void)
+{
+	u16 usPHYModeStatus;
+	if (!PHYRead (0x01, &usPHYModeStatus))
+	{
+		return FALSE;
+	}
+
+	return usPHYModeStatus & (1 << 2) ? TRUE : FALSE;
+}
+
+TNetDeviceSpeed CSMSC951xDevice::GetLinkSpeed (void)
+{
+	u16 usPHYSpecialControlStatus;
+	if (!PHYRead (0x1F, &usPHYSpecialControlStatus))
+	{
+		return NetDeviceSpeedUnknown;
+	}
+
+	// check for Auto-negotiation done
+	if (!(usPHYSpecialControlStatus & (1 << 12)))
+	{
+		return NetDeviceSpeedUnknown;
+	}
+
+	switch ((usPHYSpecialControlStatus >> 2) & 7)
+	{
+	case 0b001:	return NetDeviceSpeed10Half;
+	case 0b010:	return NetDeviceSpeed100Half;
+	case 0b101:	return NetDeviceSpeed10Full;
+	case 0b110:	return NetDeviceSpeed100Full;
+	default:	return NetDeviceSpeedUnknown;
+	}
+}
+
+boolean CSMSC951xDevice::PHYWrite (u8 uchIndex, u16 usValue)
+{
+	assert (uchIndex <= 31);
+
+	if (   !PHYWaitNotBusy ()
+	    || !WriteReg (MII_DATA, usValue))
+	{
+		return FALSE;
+	}
+
+	u32 nMIIAddress = (PHY_ID_INTERNAL << 11) | ((u32) uchIndex << 6);
+	if (!WriteReg (MII_ADDR, nMIIAddress | MII_WRITE | MII_BUSY))
+	{
+		return FALSE;
+	}
+
+	return PHYWaitNotBusy ();
+}
+
+boolean CSMSC951xDevice::PHYRead (u8 uchIndex, u16 *pValue)
+{
+	assert (uchIndex <= 31);
+
+	if (!PHYWaitNotBusy ())
+	{
+		return FALSE;
+	}
+
+	u32 nMIIAddress = (PHY_ID_INTERNAL << 11) | ((u32) uchIndex << 6);
+	u32 nValue;
+	if (   !WriteReg (MII_ADDR, nMIIAddress | MII_BUSY)
+	    || !PHYWaitNotBusy ()
+	    || !ReadReg (MII_DATA, &nValue))
+	{
+		return FALSE;
+	}
+
+	assert (pValue != 0);
+	*pValue = nValue & 0xFFFF;
+
+	return TRUE;
+}
+
+boolean CSMSC951xDevice::PHYWaitNotBusy (void)
+{
+	CTimer *pTimer = CTimer::Get ();
+	assert (pTimer != 0);
+
+	unsigned nStartTicks = pTimer->GetTicks ();
+
+	u32 nValue;
+	do
+	{
+		if (pTimer->GetTicks () - nStartTicks >= HZ)
+		{
+			return FALSE;
+		}
+
+		if (!ReadReg (MII_ADDR, &nValue))
+		{
+			return FALSE;
+		}
+	}
+	while (nValue & MII_BUSY);
+
 	return TRUE;
 }
 

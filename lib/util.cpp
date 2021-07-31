@@ -2,7 +2,7 @@
 // util.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014-2015  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2020  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -21,7 +21,27 @@
 
 void *memset (void *pBuffer, int nValue, size_t nLength)
 {
-	char *p = (char *) pBuffer;
+	u32 *p32 = (u32 *) pBuffer;
+
+	if (   ((uintptr) p32 & 3) == 0
+	    && nLength >= 16)
+	{
+		u32 nValue32 = nValue | nValue << 8;
+		nValue32 |= nValue32 << 16;
+
+		do
+		{
+			*p32++ = nValue32;
+			*p32++ = nValue32;
+			*p32++ = nValue32;
+			*p32++ = nValue32;
+
+			nLength -= 16;
+		}
+		while (nLength >= 16);
+	}
+
+	char *p = (char *) p32;
 
 	while (nLength--)
 	{
@@ -31,18 +51,29 @@ void *memset (void *pBuffer, int nValue, size_t nLength)
 	return pBuffer;
 }
 
-void *memcpy (void *pDest, const void *pSrc, size_t nLength)
+void *memmove (void *pDest, const void *pSrc, size_t nLength)
 {
-	char *pd = (char *) pDest;
-	char *ps = (char *) pSrc;
+	char *pchDest = (char *) pDest;
+	const char *pchSrc = (const char *) pSrc;
 
-	while (nLength--)
+	if (   pchSrc < pchDest
+	    && pchDest < pchSrc + nLength)
 	{
-		*pd++ = *ps++;
+		pchSrc += nLength;
+		pchDest += nLength;
+
+		while (nLength--)
+		{
+			*--pchDest = *--pchSrc;
+		}
+
+		return pDest;
 	}
 
-	return pDest;
+	return memcpy (pDest, pSrc, nLength);
 }
+
+#if STDLIB_SUPPORT <= 1
 
 int memcmp (const void *pBuffer1, const void *pBuffer2, size_t nLength)
 {
@@ -102,6 +133,128 @@ int strcmp (const char *pString1, const char *pString2)
 		return 1;
 	}
 	else if (*pString1 < *pString2)
+	{
+		return -1;
+	}
+
+	return 0;
+}
+
+static int toupper (int c)
+{
+	if ('a' <= c && c <= 'z')
+	{
+		c -= 'a' - 'A';
+	}
+
+	return c;
+}
+
+int strcasecmp (const char *pString1, const char *pString2)
+{
+	int nChar1, nChar2;
+
+	while (   (nChar1 = toupper (*pString1)) != '\0'
+	       && (nChar2 = toupper (*pString2)) != '\0')
+	{
+		if (nChar1 > nChar2)
+		{
+			return 1;
+		}
+		else if (nChar1 < nChar2)
+		{
+			return -1;
+		}
+
+		pString1++;
+		pString2++;
+	}
+
+	nChar2 = toupper (*pString2);
+
+	if (nChar1 > nChar2)
+	{
+		return 1;
+	}
+	else if (nChar1 < nChar2)
+	{
+		return -1;
+	}
+
+	return 0;
+}
+
+int strncmp (const char *pString1, const char *pString2, size_t nMaxLen)
+{
+	while (   nMaxLen > 0
+	       && *pString1 != '\0'
+	       && *pString2 != '\0')
+	{
+		if (*pString1 > *pString2)
+		{
+			return 1;
+		}
+		else if (*pString1 < *pString2)
+		{
+			return -1;
+		}
+
+		nMaxLen--;
+		pString1++;
+		pString2++;
+	}
+
+	if (nMaxLen == 0)
+	{
+		return 0;
+	}
+
+	if (*pString1 > *pString2)
+	{
+		return 1;
+	}
+	else if (*pString1 < *pString2)
+	{
+		return -1;
+	}
+
+	return 0;
+}
+
+int strncasecmp (const char *pString1, const char *pString2, size_t nMaxLen)
+{
+	int nChar1, nChar2;
+
+	while (   nMaxLen > 0
+	       && (nChar1 = toupper (*pString1)) != '\0'
+	       && (nChar2 = toupper (*pString2)) != '\0')
+	{
+		if (nChar1 > nChar2)
+		{
+			return 1;
+		}
+		else if (nChar1 < nChar2)
+		{
+			return -1;
+		}
+
+		nMaxLen--;
+		pString1++;
+		pString2++;
+	}
+
+	nChar2 = toupper (*pString2);
+
+	if (nMaxLen == 0)
+	{
+		return 0;
+	}
+
+	if (nChar1 > nChar2)
+	{
+		return 1;
+	}
+	else if (nChar1 < nChar2)
 	{
 		return -1;
 	}
@@ -172,6 +325,43 @@ char *strchr (const char *pString, int chChar)
 		if (*pString == chChar)
 		{
 			return (char *) pString;
+		}
+
+		pString++;
+	}
+
+	return 0;
+}
+
+char *strstr (const char *pString, const char *pNeedle)
+{
+	if (!*pString)
+	{
+		if (*pNeedle)
+		{
+			return 0;
+		}
+
+		return (char *) pString;
+	}
+
+	while (*pString)
+	{
+		size_t i = 0;
+
+		while (1)
+		{
+			if (!pNeedle[i])
+			{
+				return (char *) pString;
+			}
+
+			if (pNeedle[i] != pString[i])
+			{
+				break;
+			}
+
+			i++;
 		}
 
 		pString++;
@@ -363,6 +553,145 @@ unsigned long strtoul (const char *pString, char **ppEndPtr, int nBase)
 	return ulResult;
 }
 
+unsigned long long int strtoull (const char *pString, char **ppEndPtr, int nBase)
+{
+	unsigned long long ullResult = 0;
+	unsigned long long ullPrevResult;
+	int bMinus = 0;
+	int bFirst = 1;
+
+	if (ppEndPtr != 0)
+	{
+		*ppEndPtr = (char *) pString;
+	}
+
+	if (   nBase != 0
+	    && (   nBase < 2
+	        || nBase > 36))
+	{
+		return ullResult;
+	}
+
+	int c;
+	while ((c = *pString) == ' ' || c == '\f' || c == '\n' || c == '\r' || c == '\t' || c == '\v')
+	{
+		pString++;
+	}
+
+	if (   *pString == '+'
+	    || *pString == '-')
+	{
+		if (*pString++ == '-')
+		{
+			bMinus = 1;
+		}
+	}
+
+	if (*pString == '0')
+	{
+		pString++;
+
+		if (   *pString == 'x'
+		    || *pString == 'X')
+		{
+			if (   nBase != 0
+			    && nBase != 16)
+			{
+				return ullResult;
+			}
+
+			nBase = 16;
+
+			pString++;
+		}
+		else
+		{
+			if (nBase == 0)
+			{
+				nBase =  8;
+			}
+		}
+	}
+	else
+	{
+		if (nBase == 0)
+		{
+			nBase = 10;
+		}
+	}
+
+	while (1)
+	{
+		int c = *pString;
+
+		if (c < '0')
+		{
+			break;
+		}
+
+		if ('a' <= c && c <= 'z')
+		{
+			c -= 'a' - 'A';
+		}
+
+		if (c >= 'A')
+		{
+			c -= 'A' - '9' - 1;
+		}
+
+		c -= '0';
+
+		if (c >= nBase)
+		{
+			break;
+		}
+
+		ullPrevResult = ullResult;
+
+		ullResult *= nBase;
+		ullResult += c;
+
+		if (ullResult < ullPrevResult)
+		{
+			ullResult = (unsigned long) -1;
+
+			if (ppEndPtr != 0)
+			{
+				*ppEndPtr = (char *) pString;
+			}
+
+			return ullResult;
+		}
+
+		pString++;
+		bFirst = 0;
+	}
+
+	if (ppEndPtr != 0)
+	{
+		*ppEndPtr = (char *) pString;
+	}
+
+	if (bFirst)
+	{
+		return ullResult;
+	}
+
+	if (bMinus)
+	{
+		ullResult = -ullResult;
+	}
+
+	return ullResult;
+}
+
+int atoi (const char *pString)
+{
+	return (int) strtoul (pString, 0, 10);
+}
+
+#endif
+
 int char2int (char chValue)
 {
 	int nResult = chValue;
@@ -389,6 +718,23 @@ u32 bswap32 (u32 ulValue)
 		| ((ulValue & 0x0000FF00) << 8)
 		| ((ulValue & 0x00FF0000) >> 8)
 		| ((ulValue & 0xFF000000) >> 24);
+}
+
+#endif
+
+#if !defined (__GNUC__) || (AARCH == 32 && STDLIB_SUPPORT == 0)
+
+int parity32 (unsigned nValue)
+{
+	int nResult = 0;
+
+	while (nValue != 0)
+	{
+		nResult ^= (nValue & 1);
+		nValue >>= 1;
+	}
+
+	return nResult;
 }
 
 #endif

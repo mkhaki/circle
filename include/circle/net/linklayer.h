@@ -2,7 +2,7 @@
 // linklayer.h
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2015  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2015-2020  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -24,7 +24,7 @@
 #include <circle/net/netdevlayer.h>
 #include <circle/net/arphandler.h>
 #include <circle/net/ipaddress.h>
-#include <circle/usb/macaddress.h>
+#include <circle/macaddress.h>
 #include <circle/net/netqueue.h>
 #include <circle/macros.h>
 #include <circle/types.h>
@@ -39,6 +39,8 @@ struct TEthernetHeader
 }
 PACKED;
 
+class CNetworkLayer;
+
 class CLinkLayer
 {
 public:
@@ -47,6 +49,9 @@ public:
 
 	boolean Initialize (void);
 
+	// we need a back way to the network layer for notification
+	void AttachLayer (CNetworkLayer *pNetworkLayer);
+
 	void Process (void);
 
 	boolean Send (const CIPAddress &rReceiver, const void *pIPPacket, unsigned nLength);
@@ -54,15 +59,31 @@ public:
 	// pBuffer must have size FRAME_BUFFER_SIZE
 	boolean Receive (void *pBuffer, unsigned *pResultLength);
 
+public:
+	boolean SendRaw (const void *pFrame, unsigned nLength);
+
+	// pBuffer must have size FRAME_BUFFER_SIZE
+	boolean ReceiveRaw (void *pBuffer, unsigned *pResultLength, CMACAddress *pSender = 0);
+
+	// nProtocolType is in host byte order
+	boolean EnableReceiveRaw (u16 nProtocolType);
+
+private:
+	// return IP packet to the network layer for notification
+	void ResolveFailed (const void *pReturnedFrame, unsigned nLength);
+	friend class CARPHandler;
+
 private:
 	CNetConfig *m_pNetConfig;
 	CNetDeviceLayer *m_pNetDevLayer;
+	CNetworkLayer *m_pNetworkLayer;
 	CARPHandler *m_pARPHandler;
 
 	CNetQueue m_ARPRxQueue;
 	CNetQueue m_IPRxQueue;
 
-	unsigned char *m_pBuffer;
+	CNetQueue m_RawRxQueue;
+	u16 m_nRawProtocolType;
 };
 
 #endif

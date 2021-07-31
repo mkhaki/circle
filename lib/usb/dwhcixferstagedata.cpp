@@ -2,7 +2,7 @@
 // dwhcixferstagedata.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014-2015  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2021  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -22,23 +22,31 @@
 #include <circle/usb/dwhciframeschednper.h>
 #include <circle/usb/dwhciframeschednsplit.h>
 #include <circle/usb/dwhci.h>
+#include <circle/usb/usbhostcontroller.h>
 #include <circle/logger.h>
+#include <circle/timer.h>
 #include <assert.h>
+
+#define MAX_BULK_TRIES		8
 
 CDWHCITransferStageData::CDWHCITransferStageData (unsigned	 nChannel,
 						  CUSBRequest	*pURB,
 						  boolean	 bIn,
-						  boolean	 bStatusStage)
+						  boolean	 bStatusStage,
+						  unsigned	 nTimeoutMs)
 :	m_nChannel (nChannel),
 	m_pURB (pURB),
 	m_bIn (bIn),
 	m_bStatusStage (bStatusStage),
+	m_nTimeoutHZ (USB_TIMEOUT_NONE),
 	m_bSplitComplete (FALSE),
 	m_nTotalBytesTransfered (0),
 	m_nState (0),
 	m_nSubState (0),
 	m_nTransactionStatus (0),
+	m_nErrorCount (0),
 	m_pTempBuffer (0),
+	m_nStartTicksHZ (0),
 	m_pFrameScheduler (0)
 {
 	assert (m_pURB != 0);
@@ -101,7 +109,7 @@ CDWHCITransferStageData::CDWHCITransferStageData (unsigned	 nChannel,
 	}
 
 	assert (m_pBufferPointer != 0);
-	assert (((u32) m_pBufferPointer & 3) == 0);
+	assert (((uintptr) m_pBufferPointer & 3) == 0);
 
 	if (m_bSplitTransaction)
 	{
@@ -125,6 +133,15 @@ CDWHCITransferStageData::CDWHCITransferStageData (unsigned	 nChannel,
 			assert (m_pFrameScheduler != 0);
 		}
 	}
+
+	if (nTimeoutMs != USB_TIMEOUT_NONE)
+	{
+		assert (m_pEndpoint->GetType () == EndpointTypeInterrupt);
+
+		m_nTimeoutHZ = MSEC2HZ (nTimeoutMs);
+		assert (m_nTimeoutHZ > 0);
+		m_nStartTicksHZ = CTimer::Get ()->GetTicks ();
+	}
 }
 
 CDWHCITransferStageData::~CDWHCITransferStageData (void)
@@ -140,6 +157,11 @@ CDWHCITransferStageData::~CDWHCITransferStageData (void)
 	m_pEndpoint = 0;
 	m_pDevice = 0;
 	m_pURB = 0;
+}
+
+void CDWHCITransferStageData::SetChannelNumber (unsigned nChannel)
+{
+	m_nChannel = nChannel;
 }
 
 void CDWHCITransferStageData::TransactionComplete (u32 nStatus, u32 nPacketsLeft, u32 nBytesLeft)
@@ -160,7 +182,23 @@ void CDWHCITransferStageData::TransactionComplete (u32 nStatus, u32 nPacketsLeft
 	       | DWHCI_HOST_CHAN_INT_NAK
 	       | DWHCI_HOST_CHAN_INT_NYET))
 	{
-		return;
+		if (   (nStatus & DWHCI_HOST_CHAN_INT_NAK)
+		    && m_pURB->IsCompleteOnNAK ())
+		{
+			assert (m_bIn);
+
+			m_nPackets = 0;		// no data is available, complete transfer
+
+			return;
+		}
+
+		// bulk transfers with xact error will be retried, return otherwise
+		if (   !(nStatus & DWHCI_HOST_CHAN_INT_XACT_ERROR)
+		    || m_pEndpoint->GetType () != EndpointTypeBulk
+		    || ++m_nErrorCount > MAX_BULK_TRIES)
+		{
+			return;
+		}
 	}
 
 	u32 nPacketsTransfered = m_nPacketsPerTransaction - nPacketsLeft;
@@ -185,6 +223,11 @@ void CDWHCITransferStageData::TransactionComplete (u32 nStatus, u32 nPacketsLeft
 
 	assert (nPacketsTransfered <= m_nPackets);
 	m_nPackets -= nPacketsTransfered;
+
+	if (!m_bSplitTransaction)
+	{
+		m_nPacketsPerTransaction = m_nPackets;
+	}
 
 	// if (m_nTotalBytesTransfered > m_nTransferSize) this will be false:
 	if (m_nTransferSize - m_nTotalBytesTransfered < m_nBytesPerTransaction)
@@ -332,7 +375,7 @@ u32 CDWHCITransferStageData::GetDMAAddress (void) const
 {
 	assert (m_pBufferPointer != 0);
 
-	return (u32) m_pBufferPointer;
+	return (u32) (uintptr) m_pBufferPointer;
 }
 
 u32 CDWHCITransferStageData::GetBytesToTransfer (void) const
@@ -402,6 +445,41 @@ u32 CDWHCITransferStageData::GetTransactionStatus (void) const
 	return m_nTransactionStatus;
 }
 
+TUSBError CDWHCITransferStageData::GetUSBError (void) const
+{
+	if (m_nTransactionStatus & DWHCI_HOST_CHAN_INT_STALL)
+	{
+		return USBErrorStall;
+	}
+
+	if (m_nTransactionStatus & DWHCI_HOST_CHAN_INT_XACT_ERROR)
+	{
+		return USBErrorTransaction;
+	}
+
+	if (m_nTransactionStatus & DWHCI_HOST_CHAN_INT_BABBLE_ERROR)
+	{
+		return USBErrorBabble;
+	}
+
+	if (m_nTransactionStatus & DWHCI_HOST_CHAN_INT_FRAME_OVERRUN)
+	{
+		return USBErrorFrameOverrun;
+	}
+
+	if (m_nTransactionStatus & DWHCI_HOST_CHAN_INT_DATA_TOGGLE_ERROR)
+	{
+		return USBErrorDataToggle;
+	}
+
+	if (m_nTransactionStatus & DWHCI_HOST_CHAN_INT_AHB_ERROR)
+	{
+		return USBErrorHostBus;
+	}
+
+	return USBErrorUnknown;
+}
+
 boolean CDWHCITransferStageData::IsStageComplete (void) const
 {
 	return m_nPackets == 0;
@@ -417,13 +495,36 @@ u32 CDWHCITransferStageData::GetResultLen (void) const
 	return m_nTotalBytesTransfered;
 }
 
+boolean CDWHCITransferStageData::IsTimeout (void) const
+{
+	if (m_nTimeoutHZ == USB_TIMEOUT_NONE)
+	{
+		return FALSE;
+	}
+
+	return CTimer::Get ()->GetTicks ()-m_nStartTicksHZ >= m_nTimeoutHZ ? TRUE : FALSE;
+}
+
+boolean CDWHCITransferStageData::IsRetryOK (void) const
+{
+	return m_nErrorCount <= MAX_BULK_TRIES;
+}
+
 CUSBRequest *CDWHCITransferStageData::GetURB (void) const
 {
 	assert (m_pURB != 0);
 	return m_pURB;
 }
 
+CUSBDevice *CDWHCITransferStageData::GetDevice (void) const
+{
+	assert (m_pDevice != 0);
+	return m_pDevice;
+}
+
 CDWHCIFrameScheduler *CDWHCITransferStageData::GetFrameScheduler (void) const
 {
 	return m_pFrameScheduler;
 }
+
+IMPLEMENT_CLASS_ALLOCATOR (CDWHCITransferStageData)

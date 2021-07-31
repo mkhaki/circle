@@ -2,7 +2,7 @@
 // scheduler.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2015-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2015-2021  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -29,7 +29,10 @@ CScheduler *CScheduler::s_pThis = 0;
 CScheduler::CScheduler (void)
 :	m_nTasks (0),
 	m_pCurrent (0),
-	m_nCurrent (0)
+	m_nCurrent (0),
+	m_pTaskSwitchHandler (0),
+	m_pTaskTerminationHandler (0),
+	m_iSuspendNewTasks (0)
 {
 	assert (s_pThis == 0);
 	s_pThis = this;
@@ -40,11 +43,8 @@ CScheduler::CScheduler (void)
 
 CScheduler::~CScheduler (void)
 {
-	assert (m_nTasks == 1);
-	assert (m_pTask[0] == m_pCurrent);
-	RemoveTask (m_pCurrent);
-	delete m_pCurrent;
-	m_pCurrent = 0;
+	m_pTaskSwitchHandler = 0;
+	m_pTaskTerminationHandler = 0;
 
 	s_pThis = 0;
 }
@@ -67,6 +67,11 @@ void CScheduler::Yield (void)
 	TTaskRegisters *pOldRegs = m_pCurrent->GetRegs ();
 	m_pCurrent = pNext;
 	TTaskRegisters *pNewRegs = m_pCurrent->GetRegs ();
+
+	if (m_pTaskSwitchHandler != 0)
+	{
+		(*m_pTaskSwitchHandler) (m_pCurrent);
+	}
 
 	assert (pOldRegs != 0);
 	assert (pNewRegs != 0);
@@ -112,9 +117,69 @@ void CScheduler::usSleep (unsigned nMicroSeconds)
 	}
 }
 
+CTask *CScheduler::GetCurrentTask (void)
+{
+	return m_pCurrent;
+}
+
+boolean CScheduler::IsValidTask (CTask *pTask)
+{
+	unsigned i;
+	for (i = 0; i < m_nTasks; i++)
+	{
+		if (m_pTask[i] != 0 && m_pTask[i] == pTask)
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+void CScheduler::RegisterTaskSwitchHandler (TSchedulerTaskHandler *pHandler)
+{
+	assert (m_pTaskSwitchHandler == 0);
+	m_pTaskSwitchHandler = pHandler;
+	assert (m_pTaskSwitchHandler != 0);
+}
+
+void CScheduler::RegisterTaskTerminationHandler (TSchedulerTaskHandler *pHandler)
+{
+	assert (m_pTaskTerminationHandler == 0);
+	m_pTaskTerminationHandler = pHandler;
+	assert (m_pTaskTerminationHandler != 0);
+}
+
+void CScheduler::SuspendNewTasks (void)
+{
+	m_iSuspendNewTasks++;
+}
+
+void CScheduler::ResumeNewTasks (void)
+{
+	assert(m_iSuspendNewTasks > 0);
+	m_iSuspendNewTasks--;
+	if (m_iSuspendNewTasks == 0)
+	{
+		// Resume all new tasks
+		unsigned i;
+		for (i = 0; i < m_nTasks; i++)
+		{
+			if (m_pTask[i] != 0 && m_pTask[i]->GetState() == TaskStateNew)
+			{
+				m_pTask[i]->Start();
+			}
+		}
+
+	}
+}
+
 void CScheduler::AddTask (CTask *pTask)
 {
 	assert (pTask != 0);
+
+	if (m_iSuspendNewTasks)
+	{
+		pTask->SetState(TaskStateNew);
+	}
 
 	unsigned i;
 	for (i = 0; i < m_nTasks; i++)
@@ -155,37 +220,95 @@ void CScheduler::RemoveTask (CTask *pTask)
 	assert (0);
 }
 
-void CScheduler::BlockTask (CTask **ppTask)
+boolean CScheduler::BlockTask (CTask **ppWaitListHead, unsigned nMicroSeconds)
 {
-	assert (ppTask != 0);
-	*ppTask = m_pCurrent;
-
+	assert (ppWaitListHead != 0);
+	assert (m_pCurrent->m_pWaitListNext == 0);
 	assert (m_pCurrent != 0);
 	assert (m_pCurrent->GetState () == TaskStateReady);
-	m_pCurrent->SetState (TaskStateBlocked);
+
+	m_SpinLock.Acquire ();
+
+	// Add current task to waiting task list
+	m_pCurrent->m_pWaitListNext = *ppWaitListHead;
+	*ppWaitListHead = m_pCurrent;
+
+	if (nMicroSeconds == 0)
+	{
+		m_pCurrent->SetState (TaskStateBlocked);
+	}
+	else
+	{
+		unsigned nTicks = nMicroSeconds * (CLOCKHZ / 1000000);
+		unsigned nStartTicks = CTimer::Get ()->GetClockTicks ();
+
+		m_pCurrent->SetWakeTicks (nStartTicks + nTicks);
+		m_pCurrent->SetState (TaskStateBlockedWithTimeout);
+	}
+	
+	m_SpinLock.Release ();
 
 	Yield ();
+
+	m_SpinLock.Acquire ();
+
+	// Remove this task from the wait list in case was woken by timeout and
+	// not by the event signalling (in which case the list will already be 
+	// cleared and the following is a no-op)
+	CTask* pPrev = 0;
+	CTask* p = *ppWaitListHead;
+	while (p)
+	{
+		if (p == m_pCurrent)
+		{
+			if (pPrev)
+				pPrev->m_pWaitListNext = p->m_pWaitListNext;
+			else
+				*ppWaitListHead = p->m_pWaitListNext;
+		}
+		pPrev = p;
+		p = p->m_pWaitListNext;
+	}
+	m_pCurrent->m_pWaitListNext = nullptr;
+
+	m_SpinLock.Release ();
+
+	// GetWakeTicks Will be zero if timeout expired, non-zero if event signalled
+	return m_pCurrent->GetWakeTicks() == 0;		
 }
 
-void CScheduler::WakeTask (CTask **ppTask)
+void CScheduler::WakeTasks (CTask **ppWaitListHead)
 {
-	assert (ppTask != 0);
-	CTask *pTask = *ppTask;
+	assert (ppWaitListHead != 0);
 
-	*ppTask = 0;
+	m_SpinLock.Acquire ();
 
-#ifdef NDEBUG
-	if (   pTask == 0
-	    || pTask->GetState () != TaskStateBlocked)
+	CTask *pTask = *ppWaitListHead;
+	*ppWaitListHead = 0;
+
+	while (pTask)
 	{
-		CLogger::Get ()->Write (FromScheduler, LogPanic, "Tried to wake non-blocked task");
-	}
+#ifdef NDEBUG
+		if (   pTask == 0
+		    ||    (pTask->GetState () != TaskStateBlocked
+		       && pTask->GetState () != TaskStateBlockedWithTimeout))
+		{
+			CLogger::Get ()->Write (FromScheduler, LogPanic, "Tried to wake non-blocked task");
+		}
 #else
-	assert (pTask != 0);
-	assert (pTask->GetState () == TaskStateBlocked);
+		assert (pTask != 0);
+		assert (   pTask->GetState () == TaskStateBlocked
+		        || pTask->GetState () == TaskStateBlockedWithTimeout);
 #endif
 
-	pTask->SetState (TaskStateReady);
+		pTask->SetState (TaskStateReady);
+
+		CTask* pNext = pTask->m_pWaitListNext;
+		pTask->m_pWaitListNext = 0;
+		pTask = pNext;
+	}
+
+	m_SpinLock.Release ();
 }
 
 unsigned CScheduler::GetNextTask (void)
@@ -213,7 +336,18 @@ unsigned CScheduler::GetNextTask (void)
 			return nTask;
 
 		case TaskStateBlocked:
+		case TaskStateNew:
 			continue;
+
+		case TaskStateBlockedWithTimeout:
+			if ((int) (pTask->GetWakeTicks () - nTicks) > 0)
+			{
+				continue;
+			}
+			pTask->SetState (TaskStateReady);
+			pTask->SetWakeTicks(0);		// Use as flag that timeout expired
+			return nTask;
+
 
 		case TaskStateSleeping:
 			if ((int) (pTask->GetWakeTicks () - nTicks) > 0)
@@ -224,6 +358,10 @@ unsigned CScheduler::GetNextTask (void)
 			return nTask;
 
 		case TaskStateTerminated:
+			if (m_pTaskTerminationHandler != 0)
+			{
+				(*m_pTaskTerminationHandler) (pTask);
+			}
 			RemoveTask (pTask);
 			delete pTask;
 			return MAX_TASKS;

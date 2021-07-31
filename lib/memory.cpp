@@ -2,7 +2,7 @@
 // memory.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014-2015  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2020  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -19,7 +19,9 @@
 //
 #include <circle/memory.h>
 #include <circle/armv6mmu.h>
+#include <circle/armv7lpae.h>
 #include <circle/bcmpropertytags.h>
+#include <circle/machineinfo.h>
 #include <circle/alloc.h>
 #include <circle/synchronize.h>
 #include <circle/spinlock.h>
@@ -32,16 +34,16 @@
 			 | ARM_CONTROL_L1_INSTRUCTION_CACHE	\
 			 | ARM_CONTROL_BRANCH_PREDICTION	\
 			 | ARM_CONTROL_EXTENDED_PAGE_TABLE)
-
-#define TTBCR_SPLIT	3
 #else
 #define MMU_MODE	(  ARM_CONTROL_MMU			\
 			 | ARM_CONTROL_L1_CACHE			\
 			 | ARM_CONTROL_L1_INSTRUCTION_CACHE	\
 			 | ARM_CONTROL_BRANCH_PREDICTION)
-
-#define TTBCR_SPLIT	2
 #endif
+
+#define TTBCR_SPLIT	0
+
+CMemorySystem *CMemorySystem::s_pThis = 0;
 
 CMemorySystem::CMemorySystem (boolean bEnableMMU)
 #ifndef USE_RPI_STUB_AT
@@ -51,11 +53,21 @@ CMemorySystem::CMemorySystem (boolean bEnableMMU)
 :	m_bEnableMMU (FALSE),
 	m_nMemSize (USE_RPI_STUB_AT),
 #endif
-	m_pPageTable0Default (0),
-	m_pPageTable1 (0)
+	m_nMemSizeHigh (0),
+	m_HeapLow ("heaplow"),
+#if RASPPI >= 4
+	m_HeapHigh ("heaphigh"),
+#endif
+	m_pPageTable (0)
 {
+	if (s_pThis != 0)	// ignore second instance
+	{
+		return;
+	}
+	s_pThis = this;
+
 #ifndef USE_RPI_STUB_AT
-	CBcmPropertyTags Tags;
+	CBcmPropertyTags Tags (TRUE);
 	TPropertyTagMemory TagMemory;
 	if (!Tags.GetTag (PROPTAG_GET_ARM_MEMORY, &TagMemory, sizeof TagMemory))
 	{
@@ -65,19 +77,33 @@ CMemorySystem::CMemorySystem (boolean bEnableMMU)
 
 	assert (TagMemory.nBaseAddress == 0);
 	m_nMemSize = TagMemory.nSize;
-
-	mem_init (TagMemory.nBaseAddress, m_nMemSize);
-#else
-	mem_init (0, m_nMemSize);
 #endif
+
+	size_t nBlockReserve = m_nMemSize - MEM_HEAP_START - PAGE_RESERVE;
+	m_HeapLow.Setup (MEM_HEAP_START, nBlockReserve, 0x40000);
+
+#if RASPPI >= 4
+	unsigned nRAMSize = CMachineInfo::Get ()->GetRAMSize ();
+	if (nRAMSize > 1024)
+	{
+		u64 nHighSize = (nRAMSize - 1024) * MEGABYTE;
+		if (nHighSize > MEM_HIGHMEM_END+1 - MEM_HIGHMEM_START)
+		{
+			nHighSize = MEM_HIGHMEM_END+1 - MEM_HIGHMEM_START;
+		}
+
+		m_nMemSizeHigh = (size_t) nHighSize;
+
+		m_HeapHigh.Setup (MEM_HIGHMEM_START, (size_t) nHighSize, 0);
+	}
+#endif
+
+	m_Pager.Setup (MEM_HEAP_START + nBlockReserve, PAGE_RESERVE);
 
 	if (m_bEnableMMU)
 	{
-		m_pPageTable0Default = new CPageTable (m_nMemSize);
-		assert (m_pPageTable0Default != 0);
-
-		m_pPageTable1 = new CPageTable;
-		assert (m_pPageTable1 != 0);
+		m_pPageTable = new CPageTable (m_nMemSize);
+		assert (m_pPageTable != 0);
 
 		EnableMMU ();
 
@@ -89,108 +115,63 @@ CMemorySystem::CMemorySystem (boolean bEnableMMU)
 
 CMemorySystem::~CMemorySystem (void)
 {
+	Destructor ();
+}
+
+void CMemorySystem::Destructor (void)
+{
+	if (s_pThis != this)
+	{
+		return;
+	}
+	s_pThis = 0;
+
 	if (m_bEnableMMU)
 	{
 		// disable MMU
 		u32 nControl;
 		asm volatile ("mrc p15, 0, %0, c1, c0,  0" : "=r" (nControl));
-		nControl &=  ~MMU_MODE;
+		nControl &=  ~(ARM_CONTROL_MMU | ARM_CONTROL_L1_CACHE);
 		asm volatile ("mcr p15, 0, %0, c1, c0,  0" : : "r" (nControl) : "memory");
+
+		CleanDataCache ();
+		InvalidateDataCache ();
 
 		// invalidate unified TLB (if MMU is re-enabled later)
 		asm volatile ("mcr p15, 0, %0, c8, c7,  0" : : "r" (0) : "memory");
+		DataSyncBarrier ();
 	}
-	
-	delete m_pPageTable1;
-	m_pPageTable1 = 0;
-	
-	delete m_pPageTable0Default;
-	m_pPageTable0Default = 0;
 }
 
 #ifdef ARM_ALLOW_MULTI_CORE
 
 void CMemorySystem::InitializeSecondary (void)
 {
-	assert (m_bEnableMMU);		// required to use spin locks
+	assert (s_pThis != 0);
+	assert (s_pThis->m_bEnableMMU);		// required to use spin locks
 
-	EnableMMU ();
+	s_pThis->EnableMMU ();
 }
 
 #endif
 
-u32 CMemorySystem::GetMemSize (void) const
+size_t CMemorySystem::GetMemSize (void) const
 {
-	return m_nMemSize;
+	assert (s_pThis != 0);
+	return s_pThis->m_nMemSize + s_pThis->m_nMemSizeHigh;
 }
 
-#if RASPPI == 1		// tested on Raspberry Pi 1 only and currently not used in Circle
-
-void CMemorySystem::SetPageTable0 (CPageTable *pPageTable, u32 nContextID)
+CMemorySystem *CMemorySystem::Get (void)
 {
-	assert (m_bEnableMMU);
-	
-	if (pPageTable == 0)
-	{
-		pPageTable = m_pPageTable0Default;
-	}
-	
-	u32 nOldContextID;
-	asm volatile ("mrc p15, 0, %0, c13, c0,  1" : "=r" (nOldContextID));
-
-	asm volatile ("mcr p15, 0, %0, c2, c0,  0" : : "r" (pPageTable->GetBaseAddress ()) : "memory");
-
-	DataSyncBarrier ();
-	asm volatile ("mcr p15, 0, %0, c13, c0,  1" : : "r" (nContextID) : "memory");
-	InstructionMemBarrier ();
-
-	// invalidate on ASID match unified TLB
-	asm volatile ("mcr p15, 0, %0, c8, c7,  2" : : "r" (nOldContextID & 0xFF) : "memory");
+	assert (s_pThis != 0);
+	return s_pThis;
 }
-
-void CMemorySystem::SetPageTable0 (u32 nTTBR0, u32 nContextID)
-{
-	assert (m_bEnableMMU);
-	
-	u32 nOldContextID;
-	asm volatile ("mrc p15, 0, %0, c13, c0,  1" : "=r" (nOldContextID));
-
-	asm volatile ("mcr p15, 0, %0, c2, c0,  0" : : "r" (nTTBR0) : "memory");
-
-	DataSyncBarrier ();
-	asm volatile ("mcr p15, 0, %0, c13, c0,  1" : : "r" (nContextID) : "memory");
-	InstructionMemBarrier ();
-
-	// invalidate on ASID match unified TLB
-	asm volatile ("mcr p15, 0, %0, c8, c7,  2" : : "r" (nOldContextID & 0xFF) : "memory");
-}
-
-u32 CMemorySystem::GetTTBR0 (void) const
-{
-	assert (m_bEnableMMU);
-
-	u32 nTTBR0;
-	asm volatile ("mrc p15, 0, %0, c2, c0,  0" : "=r" (nTTBR0));
-	
-	return nTTBR0;
-}
-
-u32 CMemorySystem::GetContextID (void) const
-{
-	assert (m_bEnableMMU);
-
-	u32 nContextID;
-	asm volatile ("mrc p15, 0, %0, c13, c0,  1" : "=r" (nContextID));
-	
-	return nContextID;
-}
-
-#endif
 
 void CMemorySystem::EnableMMU (void)
 {
 	assert (m_bEnableMMU);
 
+#if RASPPI <= 3
 	u32 nAuxControl;
 	asm volatile ("mrc p15, 0, %0, c1, c0,  1" : "=r" (nAuxControl));
 #if RASPPI == 1
@@ -208,22 +189,45 @@ void CMemorySystem::EnableMMU (void)
 	asm volatile ("mcr p15, 0, %0, c2, c0,  2" : : "r" (TTBCR_SPLIT));
 
 	// set TTBR0
-	assert (m_pPageTable0Default != 0);
-	asm volatile ("mcr p15, 0, %0, c2, c0,  0" : : "r" (m_pPageTable0Default->GetBaseAddress ()));
+	assert (m_pPageTable != 0);
+	asm volatile ("mcr p15, 0, %0, c2, c0,  0" : : "r" (m_pPageTable->GetBaseAddress ()));
+#else	// RASPPI <= 3
+	// set MAIR0
+	u32 nMAIR0 =   LPAE_MAIR_NORMAL   << ATTRINDX_NORMAL*8
+                     | LPAE_MAIR_DEVICE   << ATTRINDX_DEVICE*8
+	             | LPAE_MAIR_COHERENT << ATTRINDX_COHERENT*8;
+	asm volatile ("mcr p15, 0, %0, c10, c2, 0" : : "r" (nMAIR0));
 
-	// set TTBR1
-	assert (m_pPageTable1 != 0);
-	asm volatile ("mcr p15, 0, %0, c2, c0,  1" : : "r" (m_pPageTable1->GetBaseAddress ()));
-	
-	// set Domain Access Control register (Domain 0 and 1 to client)
-	asm volatile ("mcr p15, 0, %0, c3, c0,  0" : : "r" (  DOMAIN_CLIENT << 0
-							    | DOMAIN_CLIENT << 2));
+	// set TTBCR
+	asm volatile ("mcr p15, 0, %0, c2, c0,  2" : : "r" (
+		        LPAE_TTBCR_EAE
+		      | LPAE_TTBCR_EPD1
+		      | ATTRIB_SH_INNER_SHAREABLE << LPAE_TTBCR_SH0__SHIFT
+		      | LPAE_TTBCR_ORGN0_WR_BACK_ALLOCATE << LPAE_TTBCR_ORGN0__SHIFT
+		      | LPAE_TTBCR_IRGN0_WR_BACK_ALLOCATE << LPAE_TTBCR_IRGN0__SHIFT
+		      | LPAE_TTBCR_T0SZ_4GB));
+
+	// set TTBR0
+	assert (m_pPageTable != 0);
+	u64 nBaseAddress = m_pPageTable->GetBaseAddress ();
+	asm volatile ("mcrr p15, 0, %0, %1, c2" : : "r" ((u32) nBaseAddress),
+						    "r" ((u32) (nBaseAddress >> 32)));
+#endif	// RASPPI <= 3
+
+	// set Domain Access Control register (Domain 0 to client)
+	asm volatile ("mcr p15, 0, %0, c3, c0,  0" : : "r" (DOMAIN_CLIENT << 0));
 
 #ifndef ARM_ALLOW_MULTI_CORE
 	InvalidateDataCache ();
 #else
 	InvalidateDataCacheL1Only ();
 #endif
+
+	// required if MMU was previously enabled and not properly reset
+	InvalidateInstructionCache ();
+	FlushBranchTargetCache ();
+	asm volatile ("mcr p15, 0, %0, c8, c7,  0" : : "r" (0));	// invalidate unified TLB
+	DataSyncBarrier ();
 	FlushPrefetchBuffer ();
 
 	// enable MMU
@@ -240,4 +244,30 @@ void CMemorySystem::EnableMMU (void)
 #endif
 	nControl |= MMU_MODE;
 	asm volatile ("mcr p15, 0, %0, c1, c0,  0" : : "r" (nControl) : "memory");
+}
+
+u32 CMemorySystem::GetCoherentPage (unsigned nSlot)
+{
+#ifndef USE_RPI_STUB_AT
+	u32 nPageAddress = MEM_COHERENT_REGION;
+#else
+	u32 nPageAddress;
+	u32 nSize;
+
+	asm volatile
+	(
+		"push {r0-r1}\n"
+		"mov r0, #1\n"
+		"bkpt #0x7FFA\n"	// get coherent region from rpi_stub
+		"mov %0, r0\n"
+		"mov %1, r1\n"
+		"pop {r0-r1}\n"
+
+		: "=r" (nPageAddress), "=r" (nSize)
+	);
+#endif
+
+	nPageAddress += nSlot * PAGE_SIZE;
+
+	return nPageAddress;
 }

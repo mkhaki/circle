@@ -2,7 +2,7 @@
 // transportlayer.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2015-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2015-2019  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -31,8 +31,7 @@ CTransportLayer::CTransportLayer (CNetConfig *pNetConfig, CNetworkLayer *pNetwor
 :	m_pNetConfig (pNetConfig),
 	m_pNetworkLayer (pNetworkLayer),
 	m_nOwnPort (OWN_PORT_MIN),
-	m_SpinLock (FALSE),
-	m_pBuffer (0),
+	m_SpinLock (TASK_LEVEL),
 	m_TCPRejector (pNetConfig, pNetworkLayer)
 {
 	assert (m_pNetConfig != 0);
@@ -41,26 +40,12 @@ CTransportLayer::CTransportLayer (CNetConfig *pNetConfig, CNetworkLayer *pNetwor
 
 CTransportLayer::~CTransportLayer (void)
 {
-#ifndef NDEBUG
-	for (unsigned i = 0; i < m_pConnection.GetCount (); i++)
-	{
-		assert (m_pConnection[i] == 0);
-	}
-#endif
-
-	delete [] m_pBuffer;
-	m_pBuffer = 0;
-
 	m_pNetworkLayer = 0;
 	m_pNetConfig = 0;
 }
 
 boolean CTransportLayer::Initialize (void)
 {
-	assert (m_pBuffer == 0);
-	m_pBuffer = new u8[FRAME_BUFFER_SIZE];
-	assert (m_pBuffer != 0);
-
 	return TRUE;
 }
 
@@ -68,10 +53,11 @@ void CTransportLayer::Process (void)
 {
 	unsigned nResultLength;
 	CIPAddress Sender;
+	CIPAddress Receiver;
 	int nProtocol;
 	assert (m_pNetworkLayer != 0);
-	assert (m_pBuffer != 0);
-	while (m_pNetworkLayer->Receive (m_pBuffer, &nResultLength, &Sender, &nProtocol))
+	u8 Buffer[FRAME_BUFFER_SIZE];
+	while (m_pNetworkLayer->Receive (Buffer, &nResultLength, &Sender, &Receiver, &nProtocol))
 	{
 		unsigned i;
 		for (i = 0; i < m_pConnection.GetCount (); i++)
@@ -81,7 +67,8 @@ void CTransportLayer::Process (void)
 				continue;
 			}
 
-			if (((CNetConnection *) m_pConnection[i])->PacketReceived (m_pBuffer, nResultLength, Sender, nProtocol) != 0)
+			if (((CNetConnection *) m_pConnection[i])->PacketReceived (
+				Buffer, nResultLength, Sender, Receiver, nProtocol) != 0)
 			{
 				break;
 			}
@@ -90,10 +77,33 @@ void CTransportLayer::Process (void)
 		if (i >= m_pConnection.GetCount ())
 		{
 			// send RESET on not consumed TCP segment
-			m_TCPRejector.PacketReceived (m_pBuffer, nResultLength, Sender, nProtocol);
+			m_TCPRejector.PacketReceived (Buffer, nResultLength,
+						      Sender, Receiver, nProtocol);
 		}
 	}
-	
+
+	TICMPNotificationType Type;
+	u16 nSendPort;
+	u16 nReceivePort;
+	while (m_pNetworkLayer->ReceiveNotification (&Type, &Sender, &Receiver,
+						     &nSendPort, &nReceivePort, &nProtocol))
+	{
+		unsigned i;
+		for (i = 0; i < m_pConnection.GetCount (); i++)
+		{
+			if (m_pConnection[i] == 0)
+			{
+				continue;
+			}
+
+			if (((CNetConnection *) m_pConnection[i])->NotificationReceived (
+				Type, Sender, Receiver, nSendPort, nReceivePort, nProtocol) != 0)
+			{
+				break;
+			}
+		}
+	}
+
 	for (unsigned i = 0; i < m_pConnection.GetCount (); i++)
 	{
 		if (m_pConnection[i] != 0)
@@ -228,18 +238,16 @@ int CTransportLayer::Connect (CIPAddress &rIPAddress, u16 nPort, u16 nOwnPort, i
 		m_SpinLock.Release ();
 		return -1;
 	}
-	assert (m_pConnection[i] != 0);
 
+	m_SpinLock.Release ();
+
+	assert (m_pConnection[i] != 0);
 	int nResult = ((CNetConnection *) m_pConnection[i])->Connect ();
 	if (nResult < 0)
 	{
-		m_SpinLock.Release ();
-
 		return -1;
 	}
 	
-	m_SpinLock.Release ();
-
 	return i;
 }
 
@@ -367,6 +375,30 @@ int CTransportLayer::ReceiveFrom (void *pBuffer, int nFlags, CIPAddress *pForeig
 	assert (pBuffer != 0);
 	return ((CNetConnection *) m_pConnection[hConnection])->ReceiveFrom (pBuffer, nFlags,
 									     pForeignIP, pForeignPort);
+}
+
+int CTransportLayer::SetOptionBroadcast (boolean bAllowed, int hConnection)
+{
+	assert (hConnection >= 0);
+	if (   hConnection >= (int) m_pConnection.GetCount ()
+	    || m_pConnection[hConnection] == 0)
+	{
+		return -1;
+	}
+
+	return ((CNetConnection *) m_pConnection[hConnection])->SetOptionBroadcast (bAllowed);
+}
+
+boolean CTransportLayer::IsConnected (int hConnection) const
+{
+	assert (hConnection >= 0);
+	if (   hConnection >= (int) m_pConnection.GetCount ()
+	    || m_pConnection[hConnection] == 0)
+	{
+		return 0;
+	}
+
+	return ((CNetConnection *) m_pConnection[hConnection])->IsConnected ();
 }
 
 const u8 *CTransportLayer::GetForeignIP (int hConnection) const

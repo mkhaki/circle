@@ -2,7 +2,7 @@
 // httpdaemon.h
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2015-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2015-2021  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -22,37 +22,10 @@
 
 #include <circle/sched/task.h>
 #include <circle/net/netsubsystem.h>
+#include <circle/net/http.h>
 #include <circle/net/socket.h>
+#include <circle/net/ipaddress.h>
 #include <circle/types.h>
-
-#define HTTP_PORT		80
-
-#define HTTP_MAX_REQUEST_LINE	2048
-#define HTTP_MAX_URI		HTTP_MAX_REQUEST_LINE
-#define HTTP_MAX_PATH		256
-#define HTTP_MAX_PARAMS		(HTTP_MAX_URI-HTTP_MAX_PATH-1)
-#define HTTP_MAX_FORM_DATA	2048
-
-enum THTTPRequestMethod
-{
-	HTTPRequestMethodGet,
-	HTTPRequestMethodHead,
-	HTTPRequestMethodPost,
-	HTTPRequestMethodUnknown
-};
-
-enum THTTPStatus
-{
-	HTTPOK			  = 200,
-	HTTPBadRequest		  = 400,
-	HTTPNotFound		  = 404,
-	HTTPRequestEntityTooLarge = 413,
-	HTTPRequestURITooLong	  = 414,
-	HTTPInternalServerError	  = 500,
-	HTTPMethodNotImplemented  = 501,
-	HTTPVersionNotSupported	  = 505,
-	HTTPUnknownError	  = 520
-};
 
 class CHTTPDaemon : public CTask
 {
@@ -60,7 +33,8 @@ public:
 	CHTTPDaemon (CNetSubSystem *pNetSubSystem,
 		     CSocket	   *pSocket	    = 0,	// is 0 for 1st created instance (listener)
 		     unsigned	    nMaxContentSize = 0,	// buffer size for worker
-		     u16	    nPort	    = HTTP_PORT);
+		     u16	    nPort	    = HTTP_PORT,
+		     unsigned	    nMaxMultipartSize = 0);	// buffer size for multipart form data
 	~CHTTPDaemon (void);
 
 	void Run (void);
@@ -76,6 +50,20 @@ public:
 				        unsigned    *pLength,	// in: buffer size, out: content length
 				        const char **ppContentType) = 0; // set this if not "text/html"
 
+	// overwrite this to implement your own access logging
+	virtual void WriteAccessLog (const CIPAddress	&rRemoteIP,
+				     THTTPRequestMethod	 RequestMethod,
+				     const char		*pRequestURI,
+				     THTTPStatus 	 Status,
+				     unsigned		 nContentLength);
+
+protected:
+	// returns the next part from multipart form data (TRUE if available)
+	// data is not available after returning from GetContent() any more
+	boolean GetMultipartFormPart (const char **ppHeader,	// returns part header
+				      const u8	 **ppData,	// returns pointer to part data
+				      unsigned	  *pLength);	// returns part data length
+
 private:
 	void Listener (void);			// accepts incoming connections and creates worker task
 	void Worker (void);			// processes a connection
@@ -84,11 +72,15 @@ private:
 	THTTPStatus ParseMethod (char *pLine);
 	THTTPStatus ParseHeaderField (char *pLine);
 
+	void *Search (const void *pBuffer, unsigned nBufLen,
+		      const void *pNeedle, unsigned nNeedleLen);
+
 private:
 	CNetSubSystem *m_pNetSubSystem;
 	CSocket	      *m_pSocket;
 	unsigned       m_nMaxContentSize;
 	u16	       m_nPort;
+	unsigned       m_nMaxMultipartSize;
 	
 	u8 *m_pContentBuffer;
 
@@ -102,6 +94,12 @@ private:
 	boolean m_bRequestFormDataAvailable;		// form data is available
 	unsigned m_nRequestContentLength;		// length of form data from POST request
 	char m_RequestFormData[HTTP_MAX_FORM_DATA+1];	// form data from POST request
+
+	boolean m_bMultipartFormDataAvailable;		// multipart form data is available
+	char m_MultipartBoundary[HTTP_MAX_MULTIPART_BOUNDARY+1]; // boundary string
+	unsigned m_nMultipartContentLength;		// total length of multipart form data
+	char *m_pMultipartBuffer;			// pointer to allocated multipart buffer
+	char *m_pMultipartPointer;			// pointer into allocated multipart buffer
 
 	static unsigned s_nInstanceCount;
 };

@@ -2,7 +2,7 @@
 // koptions.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014-2015  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2021  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -20,6 +20,7 @@
 #include <circle/koptions.h>
 #include <circle/logger.h>
 #include <circle/util.h>
+#include <circle/sysconfig.h>
 
 #define INVALID_VALUE	((unsigned) -1)
 
@@ -29,9 +30,15 @@ CKernelOptions::CKernelOptions (void)
 :	m_nWidth (0),
 	m_nHeight (0),
 	m_nLogLevel (LogDebug),
-	m_nUSBPowerDelay (0)
+	m_nUSBPowerDelay (0),
+	m_bUSBFullSpeed (FALSE),
+	m_nSoundOption (0),
+	m_CPUSpeed (CPUSpeedLow),
+	m_nSoCMaxTemp (60)
 {
 	strcpy (m_LogDevice, "tty1");
+	strcpy (m_KeyMap, DEFAULT_KEYMAP);
+	m_SoundDevice[0] = '\0';
 
 	s_pThis = this;
 
@@ -57,8 +64,7 @@ CKernelOptions::CKernelOptions (void)
 		if (strcmp (pOption, "width") == 0)
 		{
 			unsigned nValue;
-			if (   (nValue = GetDecimal (pValue)) != INVALID_VALUE
-			    && 640 <= nValue && nValue <= 1980)
+			if ((nValue = GetDecimal (pValue)) != INVALID_VALUE)
 			{
 				m_nWidth = nValue;
 			}
@@ -66,8 +72,7 @@ CKernelOptions::CKernelOptions (void)
 		else if (strcmp (pOption, "height") == 0)
 		{
 			unsigned nValue;
-			if (   (nValue = GetDecimal (pValue)) != INVALID_VALUE
-			    && 480 <= nValue && nValue <= 1080)
+			if ((nValue = GetDecimal (pValue)) != INVALID_VALUE)
 			{
 				m_nHeight = nValue;
 			}
@@ -86,6 +91,11 @@ CKernelOptions::CKernelOptions (void)
 				m_nLogLevel = nValue;
 			}
 		}
+		else if (strcmp (pOption, "keymap") == 0)
+		{
+			strncpy (m_KeyMap, pValue, sizeof m_KeyMap-1);
+			m_KeyMap[sizeof m_KeyMap-1] = '\0';
+		}
 		else if (strcmp (pOption, "usbpowerdelay") == 0)
 		{
 			unsigned nValue;
@@ -93,6 +103,43 @@ CKernelOptions::CKernelOptions (void)
 			    && 200 <= nValue && nValue <= 8000)
 			{
 				m_nUSBPowerDelay = nValue;
+			}
+		}
+		else if (strcmp (pOption, "usbspeed") == 0)
+		{
+			if (strcmp (pValue, "full") == 0)
+			{
+				m_bUSBFullSpeed = TRUE;
+			}
+		}
+		else if (strcmp (pOption, "sounddev") == 0)
+		{
+			strncpy (m_SoundDevice, pValue, sizeof m_SoundDevice-1);
+			m_SoundDevice[sizeof m_SoundDevice-1] = '\0';
+		}
+		else if (strcmp (pOption, "soundopt") == 0)
+		{
+			unsigned nValue;
+			if (   (nValue = GetDecimal (pValue)) != INVALID_VALUE
+			    && nValue <= 2)
+			{
+				m_nSoundOption = nValue;
+			}
+		}
+		else if (strcmp (pOption, "fast") == 0)
+		{
+			if (strcmp (pValue, "true") == 0)
+			{
+				m_CPUSpeed = CPUSpeedMaximum;
+			}
+		}
+		else if (strcmp (pOption, "socmaxtemp") == 0)
+		{
+			unsigned nValue;
+			if (   (nValue = GetDecimal (pValue)) != INVALID_VALUE
+			    && 40 <= nValue && nValue <= 78)
+			{
+				m_nSoCMaxTemp = nValue;
 			}
 		}
 	}
@@ -123,9 +170,39 @@ unsigned CKernelOptions::GetLogLevel (void) const
 	return m_nLogLevel;
 }
 
+const char *CKernelOptions::GetKeyMap (void) const
+{
+	return m_KeyMap;
+}
+
 unsigned CKernelOptions::GetUSBPowerDelay (void) const
 {
 	return m_nUSBPowerDelay;
+}
+
+boolean CKernelOptions::GetUSBFullSpeed (void) const
+{
+	return m_bUSBFullSpeed;
+}
+
+const char *CKernelOptions::GetSoundDevice (void) const
+{
+	return m_SoundDevice;
+}
+
+unsigned CKernelOptions::GetSoundOption (void) const
+{
+	return m_nSoundOption;
+}
+
+TCPUSpeed CKernelOptions::GetCPUSpeed (void) const
+{
+	return m_CPUSpeed;
+}
+
+unsigned CKernelOptions::GetSoCMaxTemp (void) const
+{
+	return m_nSoCMaxTemp;
 }
 
 CKernelOptions *CKernelOptions::Get (void)

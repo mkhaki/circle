@@ -2,7 +2,7 @@
 // kernel.h
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2018  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -20,7 +20,8 @@
 #ifndef _kernel_h
 #define _kernel_h
 
-#include <circle/memory.h>
+//#define USE_SPI_MASTER_AUX		// use SPI1 (Auxiliary SPI master)
+
 #include <circle/actled.h>
 #include <circle/koptions.h>
 #include <circle/devicenameservice.h>
@@ -31,7 +32,12 @@
 #include <circle/timer.h>
 #include <circle/logger.h>
 #include <circle/types.h>
-#include <circle/spimaster.h>
+
+#ifndef USE_SPI_MASTER_AUX
+	#include <circle/spimaster.h>
+#else
+	#include <circle/spimasteraux.h>
+#endif
 
 enum TShutdownMode
 {
@@ -52,7 +58,6 @@ public:
 
 private:
 	// do not change this order
-	CMemorySystem		m_Memory;
 	CActLED			m_ActLED;
 	CKernelOptions		m_Options;
 	CDeviceNameService	m_DeviceNameService;
@@ -63,7 +68,11 @@ private:
 	CTimer			m_Timer;
 	CLogger			m_Logger;
 
+#ifndef USE_SPI_MASTER_AUX
 	CSPIMaster		m_SPIMaster;
+#else
+	CSPIMasterAUX		m_SPIMaster;
+#endif
 };
 
 #endif

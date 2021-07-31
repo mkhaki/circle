@@ -20,7 +20,6 @@
 #ifndef _kernel_h
 #define _kernel_h
 
-#include <circle/memory.h>
 #include <circle/actled.h>
 #include <circle/koptions.h>
 #include <circle/devicenameservice.h>
@@ -30,7 +29,7 @@
 #include <circle/interrupt.h>
 #include <circle/timer.h>
 #include <circle/logger.h>
-#include <circle/usb/dwhcidevice.h>
+#include <circle/usb/usbhcidevice.h>
 #include <circle/sched/scheduler.h>
 #include <circle/net/netsubsystem.h>
 #include <circle/types.h>
@@ -54,7 +53,6 @@ public:
 	
 private:
 	// do not change this order
-	CMemorySystem		m_Memory;
 	CActLED			m_ActLED;
 	CKernelOptions		m_Options;
 	CDeviceNameService	m_DeviceNameService;
@@ -64,7 +62,7 @@ private:
 	CInterruptSystem	m_Interrupt;
 	CTimer			m_Timer;
 	CLogger			m_Logger;
-	CDWHCIDevice		m_DWHCI;
+	CUSBHCIDevice		m_USBHCI;
 	CScheduler		m_Scheduler;
 	CNetSubSystem		m_Net;
 };

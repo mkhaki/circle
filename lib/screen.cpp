@@ -2,7 +2,7 @@
 // screen.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014-2016  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2020  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -24,6 +24,8 @@
 
 #define ROTORS		4
 
+#ifndef SCREEN_HEADLESS
+
 enum TScreenState
 {
 	ScreenStateStart,
@@ -36,10 +38,11 @@ enum TScreenState
 	ScreenStateNumber3
 };
 
-CScreenDevice::CScreenDevice (unsigned nWidth, unsigned nHeight, boolean bVirtual)
+CScreenDevice::CScreenDevice (unsigned nWidth, unsigned nHeight, boolean bVirtual, unsigned nDisplay)
 :	m_nInitWidth (nWidth),
 	m_nInitHeight (nHeight),
 	m_bVirtual (bVirtual),
+	m_nDisplay (nDisplay),
 	m_pFrameBuffer (0),
 	m_pBuffer (0),
 	m_nState (ScreenStateStart),
@@ -48,8 +51,16 @@ CScreenDevice::CScreenDevice (unsigned nWidth, unsigned nHeight, boolean bVirtua
 	m_nCursorY (0),
 	m_bCursorOn (TRUE),
 	m_Color (NORMAL_COLOR),
+	m_BackgroundColor (BLACK_COLOR),
+	m_ReverseAttribute (FALSE),
 	m_bInsertOn (FALSE),
 	m_bUpdated (FALSE)
+#ifdef SCREEN_DMA_BURST_LENGTH
+	, m_DMAChannel (DMA_CHANNEL_NORMAL)
+#endif
+#ifdef REALTIME
+	, m_SpinLock (TASK_LEVEL)
+#endif
 {
 }
 
@@ -69,7 +80,8 @@ boolean CScreenDevice::Initialize (void)
 {
 	if (!m_bVirtual)
 	{
-		m_pFrameBuffer = new CBcmFrameBuffer (m_nInitWidth, m_nInitHeight, DEPTH);
+		m_pFrameBuffer = new CBcmFrameBuffer (m_nInitWidth, m_nInitHeight, DEPTH,
+						      0, 0, m_nDisplay);
 #if DEPTH == 8
 		m_pFrameBuffer->SetPalette (NORMAL_COLOR, NORMAL_COLOR16);
 		m_pFrameBuffer->SetPalette (HIGH_COLOR,   HIGH_COLOR16);
@@ -85,7 +97,7 @@ boolean CScreenDevice::Initialize (void)
 			return FALSE;
 		}
 
-		m_pBuffer = (TScreenColor *) m_pFrameBuffer->GetBuffer ();
+		m_pBuffer = (TScreenColor *) (uintptr) m_pFrameBuffer->GetBuffer ();
 		m_nSize   = m_pFrameBuffer->GetSize ();
 		m_nPitch  = m_pFrameBuffer->GetPitch ();
 		m_nWidth  = m_pFrameBuffer->GetWidth ();
@@ -115,7 +127,7 @@ boolean CScreenDevice::Initialize (void)
 	ClearDisplayEnd ();
 	InvertCursor ();
 
-	CDeviceNameService::Get ()->AddDevice ("tty1", this, FALSE);
+	CDeviceNameService::Get ()->AddDevice ("tty", m_nDisplay+1, this, FALSE);
 
 	return TRUE;
 }
@@ -140,6 +152,11 @@ unsigned CScreenDevice::GetRows (void) const
 	return m_nUsedHeight / m_CharGen.GetCharHeight ();
 }
 
+CBcmFrameBuffer *CScreenDevice::GetFrameBuffer (void)
+{
+	return m_pFrameBuffer;
+}
+
 TScreenStatus CScreenDevice::GetStatus (void)
 {
 	TScreenStatus Status;
@@ -153,6 +170,8 @@ TScreenStatus CScreenDevice::GetStatus (void)
 	Status.nCursorY   = m_nCursorY;
 	Status.bCursorOn  = m_bCursorOn;
 	Status.Color      = m_Color;
+	Status.BackgroundColor = m_BackgroundColor;
+	Status.ReverseAttribute = m_ReverseAttribute;
 	Status.bInsertOn  = m_bInsertOn;
 	Status.nParam1    = m_nParam1;
 	Status.nParam2    = m_nParam2;
@@ -161,7 +180,7 @@ TScreenStatus CScreenDevice::GetStatus (void)
 	return Status;
 }
 
-boolean CScreenDevice::SetStatus (TScreenStatus Status)
+boolean CScreenDevice::SetStatus (const TScreenStatus &Status)
 {
 	if (   m_nSize  != Status.nSize
 	    || m_nPitch != m_nWidth)
@@ -188,6 +207,8 @@ boolean CScreenDevice::SetStatus (TScreenStatus Status)
 	m_nCursorY   = Status.nCursorY;
 	m_bCursorOn  = Status.bCursorOn;
 	m_Color      = Status.Color;
+	m_BackgroundColor = Status.BackgroundColor;
+	m_ReverseAttribute = Status.ReverseAttribute;
 	m_bInsertOn  = Status.bInsertOn;
 	m_nParam1    = Status.nParam1;
 	m_nParam2    = Status.nParam2;
@@ -199,8 +220,16 @@ boolean CScreenDevice::SetStatus (TScreenStatus Status)
 	return TRUE;
 }
 
-int CScreenDevice::Write (const void *pBuffer, unsigned nCount)
+int CScreenDevice::Write (const void *pBuffer, size_t nCount)
 {
+#ifdef REALTIME
+	// cannot write from IRQ_LEVEL to prevent deadlock, just ignore it
+	if (CurrentExecutionLevel () > TASK_LEVEL)
+	{
+		return nCount;
+	}
+#endif
+
 	m_SpinLock.Acquire ();
 
 	m_bUpdated = TRUE;
@@ -298,6 +327,11 @@ void CScreenDevice::Write (char chChar)
 
 		case 'C':
 			CursorRight ();
+			m_nState = ScreenStateStart;
+			break;
+
+		case 'D':
+			CursorLeft ();
 			m_nState = ScreenStateStart;
 			break;
 
@@ -515,7 +549,7 @@ void CScreenDevice::ClearDisplayEnd (void)
 	
 	while (nSize--)
 	{
-		*pBuffer++ = BLACK_COLOR;
+		*pBuffer++ = m_BackgroundColor;
 	}
 }
 
@@ -605,7 +639,7 @@ void CScreenDevice::DisplayChar (char chChar)
 	
 	if (' ' <= (unsigned char) chChar)
 	{
-		DisplayChar (chChar, m_nCursorX, m_nCursorY, m_Color);
+		DisplayChar (chChar, m_nCursorX, m_nCursorY, GetTextColor ());
 
 		CursorRight ();
 	}
@@ -628,6 +662,16 @@ void CScreenDevice::EraseChars (unsigned nCount)
 	{
 		EraseChar (nPosX, m_nCursorY);
 	}
+}
+
+TScreenColor CScreenDevice::GetTextBackgroundColor (void)
+{
+	return m_ReverseAttribute ? m_Color : m_BackgroundColor;
+}
+
+TScreenColor CScreenDevice::GetTextColor (void)
+{
+	return m_ReverseAttribute ? m_BackgroundColor : m_Color;
 }
 
 void CScreenDevice::InsertLines (unsigned nCount)	// TODO
@@ -684,6 +728,7 @@ void CScreenDevice::SetStandoutMode (unsigned nMode)
 	{
 	case 0:
 	case 27:
+		m_ReverseAttribute = FALSE;
 		m_Color = NORMAL_COLOR;
 		break;
 		
@@ -695,7 +740,10 @@ void CScreenDevice::SetStandoutMode (unsigned nMode)
 		m_Color = HALF_COLOR;
 		break;
 
-	case 7:				// TODO: reverse mode
+	case 7:
+		m_ReverseAttribute = TRUE;
+		break;
+
 	default:
 		break;
 	}
@@ -722,11 +770,18 @@ void CScreenDevice::Scroll (void)
 	unsigned nSize = m_nPitch * (m_nScrollEnd - m_nScrollStart - nLines) * sizeof (TScreenColor);
 	if (nSize > 0)
 	{
+#ifdef SCREEN_DMA_BURST_LENGTH
+		m_DMAChannel.SetupMemCopy (pTo, pFrom, nSize, SCREEN_DMA_BURST_LENGTH, FALSE);
+
+		m_DMAChannel.Start ();
+		m_DMAChannel.Wait ();
+#else
 		unsigned nSizeBlk = nSize & ~0xF;
 		memcpyblk (pTo, pFrom, nSizeBlk);
 
 		// Handle framebuffers with row lengths not aligned to 16 bytes
 		memcpy ((u8 *) pTo + nSizeBlk, (u8 *) pFrom + nSizeBlk, nSize & 0xF);
+#endif
 
 		pTo += nSize / sizeof (u32);
 	}
@@ -734,7 +789,7 @@ void CScreenDevice::Scroll (void)
 	nSize = m_nPitch * nLines * sizeof (TScreenColor) / sizeof (u32);
 	while (nSize--)
 	{
-		*pTo++ = BLACK_COLOR;
+		*pTo++ = m_BackgroundColor;
 	}
 }
 
@@ -744,8 +799,8 @@ void CScreenDevice::DisplayChar (char chChar, unsigned nPosX, unsigned nPosY, TS
 	{
 		for (unsigned x = 0; x < m_CharGen.GetCharWidth (); x++)
 		{
-			SetPixel (nPosX + x, nPosY + y,
-				  m_CharGen.GetPixel (chChar, x, y) ? Color : BLACK_COLOR);
+			SetPixel (nPosX + x, nPosY + y,  m_CharGen.GetPixel (chChar, x, y) ? 
+								Color : GetTextBackgroundColor ());
 		}
 	}
 }
@@ -756,7 +811,7 @@ void CScreenDevice::EraseChar (unsigned nPosX, unsigned nPosY)
 	{
 		for (unsigned x = 0; x < m_CharGen.GetCharWidth (); x++)
 		{
-			SetPixel (nPosX + x, nPosY + y, BLACK_COLOR);
+			SetPixel (nPosX + x, nPosY + y, m_BackgroundColor);
 		}
 	}
 }
@@ -772,13 +827,13 @@ void CScreenDevice::InvertCursor (void)
 	{
 		for (unsigned x = 0; x < m_CharGen.GetCharWidth (); x++)
 		{
-			if (GetPixel (m_nCursorX + x, m_nCursorY + y) == BLACK_COLOR)
+			if (GetPixel (m_nCursorX + x, m_nCursorY + y) == m_BackgroundColor)
 			{
 				SetPixel (m_nCursorX + x, m_nCursorY + y, m_Color);
 			}
 			else
 			{
-				SetPixel (m_nCursorX + x, m_nCursorY + y, BLACK_COLOR);
+				SetPixel (m_nCursorX + x, m_nCursorY + y, m_BackgroundColor);
 			}
 		}
 	}
@@ -801,7 +856,7 @@ TScreenColor CScreenDevice::GetPixel (unsigned nPosX, unsigned nPosY)
 		return m_pBuffer[m_nPitch * nPosY + nPosX];
 	}
 	
-	return BLACK_COLOR;
+	return m_BackgroundColor;
 }
 
 void CScreenDevice::Rotor (unsigned nIndex, unsigned nCount)
@@ -815,3 +870,76 @@ void CScreenDevice::Rotor (unsigned nIndex, unsigned nCount)
 
 	DisplayChar (chChars[nCount], nPosX, 0, HIGH_COLOR);
 }
+
+#else	// #ifndef SCREEN_HEADLESS
+
+CScreenDevice::CScreenDevice (unsigned nWidth, unsigned nHeight, boolean bVirtual, unsigned nDisplay)
+:	m_nInitWidth (nWidth),
+	m_nInitHeight (nHeight)
+{
+}
+
+CScreenDevice::~CScreenDevice (void)
+{
+}
+
+boolean CScreenDevice::Initialize (void)
+{
+	if (   m_nInitWidth > 0
+	    && m_nInitHeight > 0)
+	{
+		m_nWidth = m_nInitWidth;
+		m_nHeight = m_nInitHeight;
+	}
+	else
+	{
+		m_nWidth = 640;
+		m_nHeight = 480;
+	}
+
+	m_nUsedHeight = m_nHeight / m_CharGen.GetCharHeight () * m_CharGen.GetCharHeight ();
+
+	CDeviceNameService::Get ()->AddDevice ("tty1", this, FALSE);
+
+	return TRUE;
+}
+
+unsigned CScreenDevice::GetWidth (void) const
+{
+	return m_nWidth;
+}
+
+unsigned CScreenDevice::GetHeight (void) const
+{
+	return m_nHeight;
+}
+
+unsigned CScreenDevice::GetColumns (void) const
+{
+	return m_nWidth / m_CharGen.GetCharWidth ();
+}
+
+unsigned CScreenDevice::GetRows (void) const
+{
+	return m_nUsedHeight / m_CharGen.GetCharHeight ();
+}
+
+int CScreenDevice::Write (const void *pBuffer, size_t nCount)
+{
+	return nCount;
+}
+
+void CScreenDevice::SetPixel (unsigned nPosX, unsigned nPosY, TScreenColor Color)
+{
+}
+
+TScreenColor CScreenDevice::GetPixel (unsigned nPosX, unsigned nPosY)
+{
+	return BLACK_COLOR;
+}
+
+void CScreenDevice::Rotor (unsigned nIndex, unsigned nCount)
+{
+}
+
+#endif

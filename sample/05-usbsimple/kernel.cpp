@@ -2,7 +2,7 @@
 // kernel.cpp
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2020  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -19,6 +19,7 @@
 //
 #include "kernel.h"
 #include <circle/usb/usb.h>
+#include <circle/synchronize.h>
 #include <circle/debug.h>
 
 static const char FromKernel[] = "kernel";
@@ -27,7 +28,7 @@ CKernel::CKernel (void)
 :	m_Screen (m_Options.GetWidth (), m_Options.GetHeight ()),
 	m_Timer (&m_Interrupt),
 	m_Logger (m_Options.GetLogLevel (), &m_Timer),
-	m_DWHCI (&m_Interrupt, &m_Timer)
+	m_USBHCI (&m_Interrupt, &m_Timer)
 {
 	m_ActLED.Blink (5);	// show we are alive
 }
@@ -73,7 +74,7 @@ boolean CKernel::Initialize (void)
 
 	if (bOK)
 	{
-		bOK = m_DWHCI.Initialize ();
+		bOK = m_USBHCI.Initialize ();
 	}
 
 	return bOK;
@@ -89,20 +90,21 @@ TShutdownMode CKernel::Run (void)
 		m_Logger.Write (FromKernel, LogPanic, "USB hub not found");
 	}
 
-	TUSBDeviceDescriptor DeviceDescriptor;
-	if (m_DWHCI.GetDescriptor (pUSBHub1->GetDevice ()->GetEndpoint0 (),
+	DMA_BUFFER (u8, DeviceDescBuffer, sizeof (TUSBDeviceDescriptor));
+	TUSBDeviceDescriptor *pDeviceDescriptor = (TUSBDeviceDescriptor *) DeviceDescBuffer;
+	if (m_USBHCI.GetDescriptor (pUSBHub1->GetDevice ()->GetEndpoint0 (),
 				   DESCRIPTOR_DEVICE, DESCRIPTOR_INDEX_DEFAULT,
-				   &DeviceDescriptor, sizeof DeviceDescriptor)
-	    == sizeof DeviceDescriptor)
+				   pDeviceDescriptor, sizeof *pDeviceDescriptor)
+	    == sizeof *pDeviceDescriptor)
 	{
 		m_Logger.Write (FromKernel, LogNotice,
 				"USB hub: Vendor 0x%04X, Product 0x%04X",
-				(unsigned) DeviceDescriptor.idVendor,
-				(unsigned) DeviceDescriptor.idProduct);
+				(unsigned) pDeviceDescriptor->idVendor,
+				(unsigned) pDeviceDescriptor->idProduct);
 #ifndef NDEBUG
 		m_Logger.Write (FromKernel, LogNotice, "Dumping device descriptor");
 
-		debug_hexdump (&DeviceDescriptor, sizeof DeviceDescriptor, FromKernel);
+		debug_hexdump (pDeviceDescriptor, sizeof *pDeviceDescriptor, FromKernel);
 #endif
 	}
 	else

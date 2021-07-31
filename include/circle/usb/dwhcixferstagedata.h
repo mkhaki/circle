@@ -2,7 +2,7 @@
 // dwhcixferstagedata.h
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2021  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -17,21 +17,26 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
-#ifndef _dwhcixferstagedata_h
-#define _dwhcixferstagedata_h
+#ifndef _circle_usb_dwhcixferstagedata_h
+#define _circle_usb_dwhcixferstagedata_h
 
 #include <circle/usb/usb.h>
 #include <circle/usb/usbrequest.h>
 #include <circle/usb/usbdevice.h>
 #include <circle/usb/usbendpoint.h>
 #include <circle/usb/dwhciframescheduler.h>
+#include <circle/classallocator.h>
 #include <circle/types.h>
 
 class CDWHCITransferStageData
 {
 public:
-	CDWHCITransferStageData (unsigned nChannel, CUSBRequest *pURB, boolean bIn, boolean bStatusStage);
+	CDWHCITransferStageData (unsigned nChannel, CUSBRequest *pURB, boolean bIn,
+				 boolean bStatusStage, unsigned nTimeoutMs);
 	~CDWHCITransferStageData (void);
+
+	// reassign channel number
+	void SetChannelNumber (unsigned nChannel);
 
 	// change status
 	void TransactionComplete (u32 nStatus, u32 nPacketsLeft, u32 nBytesLeft);
@@ -71,10 +76,14 @@ public:
 
 	// check status after transaction
 	u32 GetTransactionStatus (void) const;
+	TUSBError GetUSBError (void) const;
 	boolean IsStageComplete (void) const;
 	u32 GetResultLen (void) const;
+	boolean IsTimeout (void) const;
+	boolean IsRetryOK (void) const;
 
 	CUSBRequest *GetURB (void) const;
+	CUSBDevice *GetDevice (void) const;
 	CDWHCIFrameScheduler *GetFrameScheduler (void) const;
 
 private:
@@ -82,6 +91,7 @@ private:
 	CUSBRequest	*m_pURB;
 	boolean		 m_bIn;
 	boolean		 m_bStatusStage;
+	unsigned	 m_nTimeoutHZ;
 
 	boolean		 m_bSplitTransaction;
 	boolean		 m_bSplitComplete;
@@ -100,11 +110,16 @@ private:
 	unsigned	 m_nState;
 	unsigned	 m_nSubState;
 	u32		 m_nTransactionStatus;
+	unsigned	 m_nErrorCount;
 
 	u32		*m_pTempBuffer;
 	void		*m_pBufferPointer;
 
+	unsigned	 m_nStartTicksHZ;
+
 	CDWHCIFrameScheduler *m_pFrameScheduler;
+
+	DECLARE_CLASS_ALLOCATOR
 };
 
 #endif

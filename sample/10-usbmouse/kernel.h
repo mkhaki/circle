@@ -2,7 +2,7 @@
 // kernel.h
 //
 // Circle - A C++ bare metal environment for Raspberry Pi
-// Copyright (C) 2014  R. Stange <rsta2@o2online.de>
+// Copyright (C) 2014-2020  R. Stange <rsta2@o2online.de>
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -20,7 +20,6 @@
 #ifndef _kernel_h
 #define _kernel_h
 
-#include <circle/memory.h>
 #include <circle/actled.h>
 #include <circle/koptions.h>
 #include <circle/devicenameservice.h>
@@ -30,7 +29,8 @@
 #include <circle/interrupt.h>
 #include <circle/timer.h>
 #include <circle/logger.h>
-#include <circle/usb/dwhcidevice.h>
+#include <circle/usb/usbhcidevice.h>
+#include <circle/input/mouse.h>
 #include <circle/types.h>
 
 enum TShutdownMode
@@ -51,14 +51,15 @@ public:
 	TShutdownMode Run (void);
 
 private:
-	void MouseStatusHandler (unsigned nButtons, int  nDisplacementX, int nDisplacementY);
-	static void MouseStatusStub (unsigned nButtons, int  nDisplacementX, int nDisplacementY);
+	void MouseEventHandler (TMouseEvent Event, unsigned nButtons, unsigned nPosX, unsigned nPosY, int nWheelMove);
+	static void MouseEventStub (TMouseEvent Event, unsigned nButtons, unsigned nPosX, unsigned nPosY, int nWheelMove);
 
 	void DrawLine (int nPosX1, int nPosY1, int nPosX2, int nPosY2, TScreenColor Color);
-	
+
+	static void MouseRemovedHandler (CDevice *pDevice, void *pContext);
+
 private:
 	// do not change this order
-	CMemorySystem		m_Memory;
 	CActLED			m_ActLED;
 	CKernelOptions		m_Options;
 	CDeviceNameService	m_DeviceNameService;
@@ -68,14 +69,20 @@ private:
 	CInterruptSystem	m_Interrupt;
 	CTimer			m_Timer;
 	CLogger			m_Logger;
-	CDWHCIDevice		m_DWHCI;
+	CUSBHCIDevice		m_USBHCI;
 
-	int m_nPosX;
-	int m_nPosY;
+	CMouseDevice * volatile m_pMouse;
+
+	unsigned m_nPosX;
+	unsigned m_nPosY;
+	int m_nColorIndex;
+	TScreenColor m_Color;
 
 	volatile TShutdownMode m_ShutdownMode;
 
 	static CKernel *s_pThis;
+
+	static TScreenColor s_Colors[];
 };
 
 #endif
